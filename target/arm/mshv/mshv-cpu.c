@@ -13,15 +13,44 @@
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "qemu/memalign.h"
+#include "cpu.h"
+#include "hw/boards.h"
+#include "target/arm/cpregs.h"
+#include "target/arm/internals.h"
 #include "qemu/lockable.h"
 #include "system/mshv.h"
 #include "system/mshv_int.h"
 #include "hw/hyperv/hvgdk_mini.h"
+#include "hw/hyperv/hvhdk_mini.h"
 #include <sys/ioctl.h>
 #include "system/cpus.h"
 #include "target/arm/cpu.h"
 
+#include "target/arm/mshv_arm.h"
 
+#include "internals.h"
+
+#define MAX_REGISTER_COUNT (MAX_CONST(ARRAY_SIZE(STANDARD_REGISTER_NAMES), \
+                            MAX_CONST(ARRAY_SIZE(SPECIAL_REGISTER_NAMES), \
+                                      ARRAY_SIZE(FPU_REGISTER_NAMES))))
+
+static QemuMutex *cpu_guards_lock;
+static GHashTable *cpu_guards;
+
+/**
+ * ARMHostCPUFeatures: information about the host CPU (identified
+ * by asking the host kernel)
+ */
+typedef struct ARMHostCPUFeatures {
+    ARMISARegisters isar;
+    uint64_t features;
+    uint64_t midr;
+    uint32_t reset_sctlr;
+    const char *dtb_compatible;
+} ARMHostCPUFeatures;
+
+static ARMHostCPUFeatures arm_host_cpu_features;
 
 static enum hv_register_name STANDARD_REGISTER_NAMES[32] = {
     HV_ARM64_REGISTER_X0,
@@ -102,6 +131,7 @@ int mshv_set_generic_regs(const CPUState *cpu, const hv_register_assoc *assocs,
 
 static int set_standard_regs(const CPUState *cpu)
 {
+
     size_t n_regs = ARRAY_SIZE(STANDARD_REGISTER_NAMES);
     struct hv_register_assoc *assocs;
     int ret;
@@ -129,6 +159,7 @@ static int set_standard_regs(const CPUState *cpu)
 
     return 0;
 }
+
 static int get_generic_regs(CPUState *cpu, hv_register_assoc *assocs,
                             size_t n_regs)
 {
@@ -182,6 +213,53 @@ static int get_generic_regs(CPUState *cpu, hv_register_assoc *assocs,
     }
 
     return 0;
+}
+
+static int mshv_get_host_regs(int vm_fd, hv_register_name *names,
+                             hv_register_value *values, size_t n_regs)
+{
+    uint32_t vp_index = -1;
+    size_t in_sz, names_sz, values_sz;
+    size_t page = HV_HYP_PAGE_SIZE;
+    void *in_buffer = qemu_memalign(page, page);
+    void *out_buffer = qemu_memalign(page, page);
+    hv_input_get_vp_registers *in = in_buffer;
+
+    struct mshv_root_hvcall args = {0};
+
+    names_sz = n_regs * sizeof(hv_register_name);
+    in_sz = sizeof(hv_input_get_vp_registers) + names_sz;
+
+    memset(in, 0, HV_HYP_PAGE_SIZE);
+
+    in->partition_id = -1ULL; // Self partition
+    in->vp_index = vp_index;
+    in->input_vtl.as_uint8 = 0; // Standard VTL
+    in->input_vtl.target_vtl = 0xf;
+    in->input_vtl.use_target_vtl = 1;
+
+    for (int i = 0; i < n_regs; i++) {
+        in->names[i] = names[i];
+    }
+
+    values_sz = n_regs * sizeof(hv_register_value);
+
+    args.code = HVCALL_GET_VP_REGISTERS;
+    args.in_sz = in_sz;
+    args.in_ptr = (uintptr_t)(in_buffer);
+    args.out_sz = values_sz;
+    args.out_ptr = (uintptr_t)(out_buffer);
+    args.reps =  (uint16_t) n_regs;
+
+    // printf("HV_HYP_PAGE_SIZE: %lu, hv_input_get_vp_registers size: %lu\n, hv_register_name size: %lu", 
+    //        HV_HYP_PAGE_SIZE, sizeof(hv_input_get_vp_registers), sizeof(hv_register_name));
+    // printf("in_sz: %u\n", args.in_sz);
+    // printf("out_sz: %u\n", args.out_sz);
+    // printf("reps: %u\n", args.reps);
+    // printf("in_ptr: %llx\n", args.in_ptr);
+    // printf("out_ptr: %llx\n", args.out_ptr);
+
+    return mshv_hvcall(vm_fd, &args);
 }
 
 static void populate_standard_regs(const hv_register_assoc *assocs,
@@ -282,8 +360,34 @@ int mshv_arch_put_registers(const CPUState *cpu)
     return 0;
 }
 
+// static void add_cpu_guard(int cpu_fd)
+// {
+//     printf("debug: reached add_cpu_guard\n");
+//     QemuMutex *guard;
+
+//     WITH_QEMU_LOCK_GUARD(cpu_guards_lock)
+//     {
+//         guard = g_new0(QemuMutex, 1);
+//         qemu_mutex_init(guard);
+//         g_hash_table_insert(cpu_guards, GINT_TO_POINTER(cpu_fd), guard);
+//     }
+// }
+
 int mshv_create_vcpu(int vm_fd, uint8_t vp_index, int *cpu_fd)
 {
+    int ret;
+    struct mshv_create_vp vp_arg = {
+        .vp_index = vp_index,
+    };
+
+    ret = ioctl(vm_fd, MSHV_CREATE_VP, &vp_arg);
+    if (ret < 0) {
+        error_report("failed to create mshv vcpu: %s", strerror(errno));
+        return -1;
+    }
+
+    *cpu_fd = ret;
+
     return 0;
 }
 
@@ -423,8 +527,11 @@ static int emulate_with_syndrome(CPUState *cpu,
         env->xregs[reg_index] = val;
     }
 
+    // printf("debug: emulated memory access at gpa 0x%lx, len %lu, wnr %d, reg_index %lu, pc-> %lx\n",
+    //        gpa, len, iss.wnr, reg_index, env->pc);
     env->pc += (syndrome.il == 1) ? 4 : 2;
 
+    // printf("debug: updated PC = 0x%lx\n", env->pc);
     ret = mshv_store_regs(cpu);
     if (ret < 0) {
         error_report("failed to store registers");
@@ -433,6 +540,62 @@ static int emulate_with_syndrome(CPUState *cpu,
 
     return 0;
 }
+
+// static int handle_sysreg_intercept(CPUState *cpu, const struct hyperv_message *msg)
+// {
+//     struct hv_arm64_sysreg_intercept_message *info = 
+//         (struct hv_arm64_sysreg_intercept_message *)msg->payload;
+        
+//     ARMCPU *arm_cpu = ARM_CPU(cpu);
+//     CPUARMState *env = &arm_cpu->env;
+//     int ret;
+
+//     IssSysregIntercept iss = { .raw = info->syndrome };
+//     uint32_t reg_index = iss.srt;
+//     bool is_write = (iss.read == 0);
+
+//     ret = mshv_load_regs(cpu);
+//     if (ret < 0) return -1;
+
+//     /* These fields come from the info->sysreg_info struct provided by MSHV */
+//     uint32_t op0 = info->sysreg_info.op0;
+//     uint32_t op1 = info->sysreg_info.op1;
+//     uint32_t crn = info->sysreg_info.crn;
+//     uint32_t crm = info->sysreg_info.crm;
+//     uint32_t op2 = info->sysreg_info.op2;
+
+//     uint32_t key = ENCODE_AA64_CP_REG(op0, op1, crn, crm, op2);
+//     const ARMCPRegInfo *ri = get_arm_cp_reginfo(arm_cpu->cp_regs, key);
+
+//     if (ri) {
+//         if (is_write) {
+//             uint64_t val = (reg_index < 31) ? env->xregs[reg_index] : 0;
+//             if (ri->writefn) {
+//                 ri->writefn(env, ri, val);
+//             } else {
+//                 write_cp_reg(env, ri, val);
+//             }
+//         } else {
+//             uint64_t val;
+
+//             if (ri->readfn) {
+//                 val = ri->readfn(env, ri);
+//             } else {
+//                 val = read_cp_reg(env, ri);
+//             }
+
+//             if (reg_index < 31) {
+//                 env->xregs[reg_index] = val;
+//             }
+//         }
+//     } else {
+//         fprintf(stderr, "MSHV: Unknown sysreg access: %d,%d,%d,%d,%d\n",
+//                 op0, op1, crn, crm, op2);
+//     }
+
+//     env->pc += 4;
+//     return mshv_store_regs(cpu);
+// }
 
 static int handle_unmapped_mem(int vm_fd, CPUState *cpu,
                                const struct hyperv_message *msg,
@@ -458,13 +621,71 @@ static int handle_unmapped_mem(int vm_fd, CPUState *cpu,
 
 int mshv_run_vcpu(int vm_fd, CPUState *cpu, hv_message *msg, MshvVmExit *exit)
 {
-    handle_unmapped_mem(0, NULL, NULL, NULL);
+    // printf("debug: reached mshv_run_vcpu\n");
+    int ret;
+    enum MshvVmExit exit_reason = MshvVmExitIgnore;
+    int cpu_fd = mshv_vcpufd(cpu);
+
+    // fprintf(stderr, "debug: vCPU entering MSHV_RUN_VP\n");
+    fflush(stderr);
+
+    // printf("dump cpu state before run: PC = 0x%lx\n", env->pc);
+
+    ret = ioctl(cpu_fd, MSHV_RUN_VP, msg);
+    if (ret < 0) {
+        fprintf(stderr, "MSHV: ioctl error: %s\n", strerror(errno));
+        return MshvVmExitShutdown;
+    }
+
+    // fprintf(stderr, "MSHV: Exit Message Type: 0x%x\n", msg->header.message_type);
+
+    switch (msg->header.message_type) {
+    case HVMSG_UNMAPPED_GPA:
+        
+        ret = handle_unmapped_mem(vm_fd, cpu, msg, &exit_reason);
+        if (ret < 0) {
+            error_report("failed to handle unmapped memory");
+            return -1;
+        }
+        return exit_reason;
+    case HVMSG_ARM64_SYSREG_INTERCEPT:
+        fprintf(stderr, "MSHV: Sysreg intercept (not handled yet)\n");
+        // ret = handle_sysreg_intercept(cpu, msg);
+        // if (ret < 0) {
+        error_report("failed to handle system register intercept-------------------------------------------");
+        //     return -1;
+        // }
+        // return MshvVmExitIgnore;
+        *exit = MshvVmExitIgnore;
+        return -1;
+    default:
+        fprintf(stderr, "MSHV: Unknown message type 0x%x. Stopping VM.\n", 
+                msg->header.message_type);
+        error_report("unknown message type---------------------------------------------------");
+        *exit = MshvVmExitIgnore;
+        return -1;
+    }
+
+    *exit = MshvVmExitIgnore;
     return 0;
+}
+
+void mshv_init_cpu_logic(void)
+{
+    cpu_guards_lock = g_new0(QemuMutex, 1);
+    qemu_mutex_init(cpu_guards_lock);
+    cpu_guards = g_hash_table_new(g_direct_hash, g_direct_equal);
 }
 
 void mshv_arch_init_vcpu(CPUState *cpu)
 {
-    return;
+    AccelCPUState *state = cpu->accel;
+    size_t page = HV_HYP_PAGE_SIZE;
+    void *mem = qemu_memalign(page, 2 * page);
+
+    state->hvcall_args.base = mem;
+    state->hvcall_args.input_page = mem;
+    state->hvcall_args.output_page = (uint8_t *)mem + page;
 }
 
 void mshv_remove_vcpu(int vm_fd, int cpu_fd)
@@ -474,7 +695,13 @@ void mshv_remove_vcpu(int vm_fd, int cpu_fd)
 
 void mshv_arch_destroy_vcpu(CPUState *cpu)
 {
-    return;
+    AccelCPUState *state = cpu->accel;
+
+    if(state->hvcall_args.base) {
+        qemu_vfree(state->hvcall_args.base);
+    }
+
+    state->hvcall_args = (MshvHvCallArgs){0};
 }
 
 void mshv_init_mmio_emu(void)
@@ -491,4 +718,170 @@ void mshv_arch_amend_proc_features(
 int mshv_arch_post_init_vm(int vm_fd)
 {
     return 0;
+}
+
+uint32_t mshv_arm_get_ipa_bit_size(int mshv_fd)
+{
+    int ret;
+
+    struct hv_input_get_partition_property in = {0};
+    struct hv_output_get_partition_property out = {0};
+
+    struct mshv_root_hvcall args = {0};
+
+    in.partition_id = -1ULL;
+    in.property_code = HV_PARTITION_PROPERTY_PHYSICAL_ADDRESS_WIDTH;
+    
+    args.code   = HVCALL_GET_PARTITION_PROPERTY;
+    args.in_sz  = sizeof(in);
+    args.in_ptr = (uint64_t)&in;
+    args.out_sz = sizeof(out);
+    args.out_ptr = (uint64_t)&out;
+
+    
+    ret = mshv_hvcall(mshv_fd, &args);
+
+    if (ret < 0) {
+        error_report("Failed to get IPA size");
+        return -1;
+    }
+
+    return out.property_value;
+}
+
+
+static void clamp_id_aa64mmfr0_parange_to_ipa_size(int mshv_fd, ARMISARegisters *isar)
+{
+    uint32_t ipa_size = mshv_arm_get_ipa_bit_size(mshv_fd);
+    uint64_t id_aa64mmfr0;
+
+    /* Clamp down the PARange to the IPA size the kernel supports. */
+    uint8_t index = round_down_to_parange_index(ipa_size);
+    id_aa64mmfr0 = GET_IDREG(isar, ID_AA64MMFR0);
+    id_aa64mmfr0 = (id_aa64mmfr0 & ~R_ID_AA64MMFR0_PARANGE_MASK) | index;
+        SET_IDREG(isar, ID_AA64MMFR0, id_aa64mmfr0);
+}
+
+static bool mshv_arm_get_host_cpu_features(ARMHostCPUFeatures *ahcf)
+{
+    int mshv_fd;
+    int vm_fd = mshv_state->vm;
+    int i, ret;
+    bool success = true;
+
+    const struct {
+        hv_register_name name;
+        int isar_idx;
+    } regs[] = {
+        { HV_ARM64_REGISTER_ID_AA64_PFR0_EL1,  ID_AA64PFR0_EL1_IDX },
+        { HV_ARM64_REGISTER_ID_AA64_PFR1_EL1,  ID_AA64PFR1_EL1_IDX },
+        { HV_ARM64_REGISTER_ID_AA64_ISAR0_EL1, ID_AA64ISAR0_EL1_IDX },
+        { HV_ARM64_REGISTER_ID_AA64_ISAR1_EL1, ID_AA64ISAR1_EL1_IDX },
+        { HV_ARM64_REGISTER_ID_AA64_ISAR2_EL1, ID_AA64ISAR2_EL1_IDX },
+        { HV_ARM64_REGISTER_ID_AA64_MMFR0_EL1, ID_AA64MMFR0_EL1_IDX },
+        { HV_ARM64_REGISTER_ID_AA64_MMFR1_EL1, ID_AA64MMFR1_EL1_IDX },
+        { HV_ARM64_REGISTER_ID_AA64_MMFR2_EL1, ID_AA64MMFR2_EL1_IDX },
+        { HV_ARM64_REGISTER_ID_AA64_DFR0_EL1,  ID_AA64DFR0_EL1_IDX },
+        { HV_ARM64_REGISTER_ID_AA64_DFR1_EL1,  ID_AA64DFR1_EL1_IDX },
+    };
+
+    size_t n_regs = ARRAY_SIZE(regs);
+    hv_register_name *reg_names = g_new(hv_register_name, n_regs);
+    hv_register_value *reg_values = g_new(hv_register_value, n_regs);
+    // hv_register_name midr_name = HV_ARM64_REGISTER_MIDR_EL1;
+    // hv_register_value midr_value = {0};
+
+    ret = init_mshv(&mshv_fd);
+
+    if (ret < 0) {
+        success = false;
+        goto out;
+    }
+
+    for(i = 0; i < n_regs; i++)
+    {
+        reg_names[i] = regs[i].name;
+    }
+    
+
+    // ret = mshv_get_host_regs(mshv_fd, reg_names, reg_values, n_regs);
+    ret = mshv_get_host_regs(vm_fd, reg_names, reg_values, n_regs);
+
+    if(ret < 0) {
+        error_report("Failed to get host registers");
+        success = false;
+        goto out;
+    }
+
+    for(i = 0; i < n_regs; i++) {
+        ahcf->isar.idregs[regs[i].isar_idx] = reg_values[i].reg64;
+    }
+
+    // ret = mshv_get_host_regs(vm_fd, &midr_name, &midr_value, 1);
+    g_autofree gchar *contents = NULL;
+    if (g_file_get_contents("/sys/devices/system/cpu/cpu0/regs/identification/midr_el1", 
+                            &contents, NULL, NULL)) {
+        printf("MSHV: Successfully read MIDR_EL1 from sysfs: %s\n", contents);
+        ahcf->midr = g_ascii_strtoull(contents, NULL, 0);
+        printf("MSHV: Read MIDR_EL1 from sysfs: 0x%lx\n", ahcf->midr);
+    }
+    else {
+        error_report("Failed to read MIDR_EL1 from sysfs");
+        success = false;
+        goto out;
+    }
+
+    
+    // ahcf->midr = (ret == 0) ? midr_value.reg64 : 0;
+
+    ahcf->dtb_compatible = "arm,armv8";
+    ahcf->features = (1ULL << ARM_FEATURE_V8) |
+                     (1ULL << ARM_FEATURE_NEON) |
+                     (1ULL << ARM_FEATURE_AARCH64) |
+                     (1ULL << ARM_FEATURE_PMU) |
+                     (1ULL << ARM_FEATURE_GENERIC_TIMER);
+
+    clamp_id_aa64mmfr0_parange_to_ipa_size(mshv_fd, &ahcf->isar);
+
+    /* SVE (Scalable Vector Extension) and SME (Scalable Matrix Extension) 
+     * require specific context switch logic in the accelerator. 
+     * Mask them out for now to ensure stability.
+     */
+    /* Mask SVE in PFR0 */
+    uint64_t pfr0 = GET_IDREG(&ahcf->isar, ID_AA64PFR0);
+    pfr0 &= ~R_ID_AA64PFR0_SVE_MASK; 
+    SET_IDREG(&ahcf->isar, ID_AA64PFR0, pfr0);
+
+    /* Mask SME in PFR1 */
+    uint64_t pfr1 = GET_IDREG(&ahcf->isar, ID_AA64PFR1);
+    pfr1 &= ~R_ID_AA64PFR1_SME_MASK;
+    SET_IDREG(&ahcf->isar, ID_AA64PFR1, pfr1);
+
+out: 
+    g_free(reg_names);
+    g_free(reg_values);
+    close(mshv_fd);
+    return success;
+}
+
+void mshv_arm_set_cpu_features_from_host(ARMCPU *cpu)
+{
+    if (!arm_host_cpu_features.dtb_compatible) {
+        if (!mshv_enabled() ||
+            !mshv_arm_get_host_cpu_features(&arm_host_cpu_features)) {
+            /* We can't report this error yet, so flag that we need to
+             * in arm_cpu_realizefn().
+             */
+            cpu->host_cpu_probe_failed = true;
+            printf("MSHV: Failed to get host CPU features\n");
+            return;
+        }
+    }
+
+    cpu->dtb_compatible = arm_host_cpu_features.dtb_compatible;
+    cpu->isar = arm_host_cpu_features.isar;
+    cpu->env.features = arm_host_cpu_features.features;
+    cpu->midr = arm_host_cpu_features.midr;
+    cpu->reset_sctlr = arm_host_cpu_features.reset_sctlr;
+    printf("MSHV: Successfully set CPU features from host\n");
 }

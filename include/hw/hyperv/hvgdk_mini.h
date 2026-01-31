@@ -1296,6 +1296,9 @@ enum hv_message_type {
     /* Timer notification messages. */
     HVMSG_TIMER_EXPIRED                 = 0x80000010,
 
+	/* ARM64-specific messages */
+	HVMSG_ARM64_SYSREG_INTERCEPT		= 0x80000016,
+
     /* Error messages. */
     HVMSG_INVALID_VP_REGISTER_VALUE     = 0x80000020,
     HVMSG_UNRECOVERABLE_EXCEPTION       = 0x80000021,
@@ -1465,6 +1468,37 @@ struct hv_arm64_memory_intercept_message {
     uint64_t guest_physical_address;
     uint64_t syndrome;
 };
+
+struct hv_arm64_sysreg_info {
+    uint32_t op0;
+    uint32_t op1;
+    uint32_t crn;
+    uint32_t crm;
+    uint32_t op2;
+};
+
+struct hv_arm64_sysreg_intercept_message {
+    struct hv_arm64_sysreg_info sysreg_info;   
+    uint64_t syndrome;
+    uint64_t write_value;
+};
+
+typedef union IssSysregIntercept {
+    uint64_t raw;
+    struct {
+        uint64_t res0:1;    /* Reserved */
+        uint64_t op2:3;     /* Op2 encoding */
+        uint64_t op1:3;     /* Op1 encoding */
+        uint64_t crn:4;     /* CRn encoding */
+        uint64_t rt:5;      /* Register index (X0-X30) */
+        uint64_t crm:4;     /* CRm encoding */
+        uint64_t op0:2;     /* Op0 encoding */
+        uint64_t read:1;    /* 0 = Write (MSR), 1 = Read (MRS) */
+        uint64_t res1:41;   /* Padding/Reserved */
+    };
+    /* Architectural alias: rt is the 'srt' field */
+    #define srt rt
+} IssSysregIntercept;
 
 union hv_message_flags {
     uint8_t asu8;

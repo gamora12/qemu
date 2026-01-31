@@ -110,6 +110,10 @@ void mshv_arch_destroy_vcpu(CPUState *cpu);
 void mshv_arch_amend_proc_features(
     union hv_partition_synthetic_processor_features *features);
 int mshv_arch_post_init_vm(int vm_fd);
+void mshv_init_cpu_logic(void);
+uint32_t mshv_arm_get_ipa_bit_size(int mshv_fd);
+int init_mshv(int *mshv_fd);
+int mshv_init(AccelState *as, MachineState *s);
 
 #if defined COMPILING_PER_TARGET && defined CONFIG_MSHV_IS_POSSIBLE
 int mshv_hvcall(int fd, const struct mshv_root_hvcall *args);

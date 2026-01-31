@@ -51,7 +51,7 @@ bool mshv_allowed;
 
 MshvState *mshv_state;
 
-static int init_mshv(int *mshv_fd)
+int init_mshv(int *mshv_fd)
 {
     int fd = open("/dev/mshv", O_RDWR | O_CLOEXEC);
     if (fd < 0) {
@@ -412,7 +412,7 @@ static int mshv_init_vcpu(CPUState *cpu)
     return 0;
 }
 
-static int mshv_init(AccelState *as, MachineState *ms)
+int mshv_init(AccelState *as, MachineState *ms)
 {
     MshvState *s;
     int mshv_fd, vm_fd, ret;
