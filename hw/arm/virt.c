@@ -960,7 +960,7 @@ static void create_gic(VirtMachineState *vms, MemoryRegion *mem)
 
     if (vms->gic_version != VIRT_GIC_VERSION_2 && vms->its) {
         create_its(vms);
-    } else if (vms->gic_version == VIRT_GIC_VERSION_2) {
+    } else if (vms->gic_version == VIRT_GIC_VERSION_2 || mshv_enabled()) {
         create_v2m(vms);
     }
 }
@@ -2107,7 +2107,9 @@ static void finalize_gic_version(VirtMachineState *vms)
         /* KVM w/o kernel irqchip can only deal with GICv2 */
         gics_supported |= VIRT_GIC_VERSION_2_MASK;
         accel_name = "KVM with kernel-irqchip=off";
-    } else if (tcg_enabled() || hvf_enabled() || qtest_enabled() || mshv_enabled())  {
+    } else if (mshv_enabled()) {
+        gics_supported |= VIRT_GIC_VERSION_3_MASK;
+    } else if (tcg_enabled() || hvf_enabled() || qtest_enabled())  {
         gics_supported |= VIRT_GIC_VERSION_2_MASK;
         if (module_object_class_by_name("arm-gicv3")) {
             gics_supported |= VIRT_GIC_VERSION_3_MASK;

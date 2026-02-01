@@ -325,9 +325,15 @@ int mshv_request_interrupt(MshvState *mshv_state, uint32_t interrupt_type, uint3
 
     union hv_interrupt_control control = {
         .interrupt_type = interrupt_type,
+#if defined(__x86_64__)
         .level_triggered = level_triggered,
         .logical_dest_mode = logical_dest_mode,
         .rsvd = 0,
+#elif defined(__aarch64__)
+        .rsvd1 = 0,
+        .asserted = 1,
+        .rsvd2 = 0,
+#endif
     };
 
     struct hv_input_assert_virtual_interrupt arg = {0};
