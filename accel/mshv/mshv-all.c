@@ -51,7 +51,7 @@ bool mshv_allowed;
 
 MshvState *mshv_state;
 
-static int init_mshv(int *mshv_fd)
+int init_mshv(int *mshv_fd)
 {
     int fd = open("/dev/mshv", O_RDWR | O_CLOEXEC);
     if (fd < 0) {
@@ -156,6 +156,7 @@ static int set_synthetic_proc_features(int vm_fd)
     features.tb_flush_hypercalls = 1;
     features.synthetic_cluster_ipi = 1;
     features.direct_synthetic_timers = 1;
+    features.access_vp_regs = 1;
 
     mshv_arch_amend_proc_features(&features);
 
@@ -400,19 +401,19 @@ static int mshv_init_vcpu(CPUState *cpu)
     int ret;
 
     cpu->accel = g_new0(AccelCPUState, 1);
-    mshv_arch_init_vcpu(cpu);
 
     ret = mshv_create_vcpu(vm_fd, vp_index, &cpu->accel->cpufd);
     if (ret < 0) {
         return -1;
     }
 
+    mshv_arch_init_vcpu(cpu);
     cpu->accel->dirty = true;
 
     return 0;
 }
 
-static int mshv_init(AccelState *as, MachineState *ms)
+int mshv_init(AccelState *as, MachineState *ms)
 {
     MshvState *s;
     int mshv_fd, vm_fd, ret;
@@ -499,7 +500,8 @@ static int mshv_cpu_exec(CPUState *cpu)
             }
             cpu->accel->dirty = false;
         }
-
+        // uint8_t vp_index = cpu->cpu_index;
+        // printf("debug: running vcpu vp_index = %d with fd %d\n", vp_index, cpu->accel->cpufd);
         ret = mshv_run_vcpu(mshv_state->vm, cpu, &mshv_msg, &exit_reason);
         if (ret < 0) {
             error_report("Failed to run on vcpu %d", cpu->cpu_index);
@@ -565,6 +567,7 @@ static void *mshv_vcpu_thread(void *arg)
     bql_lock();
     qemu_thread_get_self(cpu->thread);
     cpu->thread_id = qemu_get_thread_id();
+    printf("debug: started vcpu thread for cpu %d\n", cpu->cpu_index);
     current_cpu = cpu;
     ret = mshv_init_vcpu(cpu);
     if (ret < 0) {
@@ -576,9 +579,12 @@ static void *mshv_vcpu_thread(void *arg)
     /* signal CPU creation */
     cpu_thread_signal_created(cpu);
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
-
+    cpu_resume(cpu);
     do {
         qemu_process_cpu_events(cpu);
+        printf("debug: vcpu %d entering mshv_cpu_exec\n", cpu->cpu_index);
+        printf("debug: vcpu %d cpu_can_run = %d\n", cpu->cpu_index,
+               cpu_can_run(cpu));
         if (cpu_can_run(cpu)) {
             mshv_cpu_exec(cpu);
         }
@@ -590,6 +596,11 @@ cleanup:
     bql_unlock();
     rcu_unregister_thread();
     return NULL;
+}
+
+static bool mshv_vcpu_thread_is_idle(CPUState *cpu)
+{
+    return false;
 }
 
 static void mshv_start_vcpu_thread(CPUState *cpu)
@@ -706,6 +717,7 @@ static void mshv_accel_ops_class_init(ObjectClass *oc, const void *data)
     AccelOpsClass *ops = ACCEL_OPS_CLASS(oc);
 
     ops->create_vcpu_thread = mshv_start_vcpu_thread;
+    ops->cpu_thread_is_idle = mshv_vcpu_thread_is_idle;
     ops->synchronize_post_init = mshv_cpu_synchronize_post_init;
     ops->synchronize_post_reset = mshv_cpu_synchronize_post_reset;
     ops->synchronize_state = mshv_cpu_synchronize;

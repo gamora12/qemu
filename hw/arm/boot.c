@@ -21,6 +21,7 @@
 #include "system/tcg.h"
 #include "system/system.h"
 #include "system/memory.h"
+#include "system/mshv.h"
 #include "system/numa.h"
 #include "hw/boards.h"
 #include "system/reset.h"
@@ -408,17 +409,6 @@ static void fdt_add_psci_node(void *fdt, ARMCPU *armcpu)
             const char comp[] = "arm,psci-1.0\0arm,psci-0.2\0arm,psci";
             qemu_fdt_setprop(fdt, "/psci", "compatible", comp, sizeof(comp));
         }
-
-        cpu_off_fn = QEMU_PSCI_0_2_FN_CPU_OFF;
-        if (arm_feature(&armcpu->env, ARM_FEATURE_AARCH64)) {
-            cpu_suspend_fn = QEMU_PSCI_0_2_FN64_CPU_SUSPEND;
-            cpu_on_fn = QEMU_PSCI_0_2_FN64_CPU_ON;
-            migrate_fn = QEMU_PSCI_0_2_FN64_MIGRATE;
-        } else {
-            cpu_suspend_fn = QEMU_PSCI_0_2_FN_CPU_SUSPEND;
-            cpu_on_fn = QEMU_PSCI_0_2_FN_CPU_ON;
-            migrate_fn = QEMU_PSCI_0_2_FN_MIGRATE;
-        }
     } else {
         qemu_fdt_setprop_string(fdt, "/psci", "compatible", "arm,psci");
 
@@ -435,10 +425,11 @@ static void fdt_add_psci_node(void *fdt, ARMCPU *armcpu)
      */
     qemu_fdt_setprop_string(fdt, "/psci", "method", psci_method);
 
-    qemu_fdt_setprop_cell(fdt, "/psci", "cpu_suspend", cpu_suspend_fn);
-    qemu_fdt_setprop_cell(fdt, "/psci", "cpu_off", cpu_off_fn);
-    qemu_fdt_setprop_cell(fdt, "/psci", "cpu_on", cpu_on_fn);
-    qemu_fdt_setprop_cell(fdt, "/psci", "migrate", migrate_fn);
+    // qemu_fdt_setprop_cell(fdt, "/psci", "cpu_suspend", cpu_suspend_fn);
+    // qemu_fdt_setprop_cell(fdt, "/psci", "cpu_off", cpu_off_fn);
+    // qemu_fdt_setprop_cell(fdt, "/psci", "cpu_on", cpu_on_fn);
+    // qemu_fdt_setprop_cell(fdt, "/psci", "migrate", migrate_fn);
+    printf("%x, %x, %x, %x\n", cpu_suspend_fn, cpu_off_fn, cpu_on_fn, migrate_fn);
 }
 
 static int fdt_add_pmem_node(void *fdt, uint32_t acells, uint32_t scells,
