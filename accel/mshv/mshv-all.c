@@ -619,7 +619,7 @@ static void *mshv_vcpu_thread(void *arg)
     /* signal CPU creation */
     cpu_thread_signal_created(cpu);
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
-    cpu_resume(cpu);
+
     do {
         qemu_process_cpu_events(cpu);
         printf("debug: vcpu %d entering mshv_cpu_exec\n", cpu->cpu_index);
