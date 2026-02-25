@@ -1765,3 +1765,16 @@ int mshv_arch_post_init_vm(int vm_fd)
 
     return ret;
 }
+
+/*
+ * x86 doesn't need to query host CPU features for partition creation
+ * in the same way ARM does - features are handled differently.
+ * Return success with features set to 0 (enable all).
+ */
+int mshv_arch_get_host_partition_features(int mshv_fd,
+                                          union hv_partition_processor_features *features)
+{
+    /* x86: Set all features to 0 (enable everything) */
+    memset(features, 0, sizeof(*features));
+    return 0;
+}

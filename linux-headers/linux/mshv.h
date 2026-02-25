@@ -27,6 +27,7 @@ enum {
 	MSHV_PT_BIT_X2APIC,
 	MSHV_PT_BIT_GPA_SUPER_PAGES,
 	MSHV_PT_BIT_COUNT,
+	MSHV_PT_BIT_CPU_AND_XSAVE_FEATURES,
 };
 
 #define MSHV_PT_FLAGS_MASK ((1 << MSHV_PT_BIT_COUNT) - 1)
@@ -51,6 +52,23 @@ struct mshv_create_partition {
 	__u64 pt_flags;
 	__u64 pt_isolation;
 };
+
+#define MSHV_NUM_CPU_FEATURES_BANKS 2
+
+struct mshv_create_partition_v2 {
+	__u64 pt_flags;
+	__u64 pt_isolation;
+	__u16 pt_num_cpu_fbanks;
+	__u8  pt_rsvd[6];       /* MBZ */
+	__u64 pt_cpu_fbanks[MSHV_NUM_CPU_FEATURES_BANKS];
+	__u64 pt_rsvd1[2];      /* MBZ */
+#if defined(__x86_64__)
+	__u64 pt_disabled_xsave;
+#else
+	__u64 pt_rsvd2;         /* MBZ */
+#endif
+};
+
 
 /* /dev/mshv */
 #define MSHV_CREATE_PARTITION	_IOW(MSHV_IOCTL, 0x00, struct mshv_create_partition)

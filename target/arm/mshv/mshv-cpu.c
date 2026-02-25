@@ -260,8 +260,13 @@ static int mshv_get_host_regs(int vm_fd, hv_register_name *names,
 
     ret = mshv_hvcall(vm_fd, &args);
 
+
     if (ret == 0) {
         memcpy(values, out_buffer, values_sz);
+        for(int i=0; i<n_regs; i++) {
+            fprintf(stderr, "MSHV DEBUG: Reg 0x%x = 0x%llx\n",
+                names[i], (unsigned long long)values[i].reg64);
+        }
     }
 
     qemu_vfree(in_buffer);
@@ -637,22 +642,6 @@ void mshv_arch_destroy_vcpu(CPUState *cpu)
     state->hvcall_args = (MshvHvCallArgs){0};
 }
 
-void mshv_init_mmio_emu(void)
-{
-    return;
-}
-
-void mshv_arch_amend_proc_features(
-    union hv_partition_synthetic_processor_features *features)
-{
-    return;
-}
-
-int mshv_arch_post_init_vm(int vm_fd)
-{
-    return 0;
-}
-
 uint32_t mshv_arm_get_ipa_bit_size(int mshv_fd)
 {
     int ret;
@@ -671,7 +660,6 @@ uint32_t mshv_arm_get_ipa_bit_size(int mshv_fd)
     args.out_sz = sizeof(out);
     args.out_ptr = (uint64_t)&out;
 
-    
     ret = mshv_hvcall(mshv_fd, &args);
 
     if (ret < 0) {
