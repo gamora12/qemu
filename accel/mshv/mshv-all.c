@@ -51,7 +51,7 @@ bool mshv_allowed;
 
 MshvState *mshv_state;
 
-static int init_mshv(int *mshv_fd)
+int init_mshv(int *mshv_fd)
 {
     int fd = open("/dev/mshv", O_RDWR | O_CLOEXEC);
     if (fd < 0) {
@@ -156,6 +156,7 @@ static int set_synthetic_proc_features(int vm_fd)
     features.tb_flush_hypercalls = 1;
     features.synthetic_cluster_ipi = 1;
     features.direct_synthetic_timers = 1;
+    features.access_vp_regs = 1;
 
     mshv_arch_amend_proc_features(&features);
 
@@ -400,12 +401,13 @@ static int mshv_init_vcpu(CPUState *cpu)
     int ret;
 
     cpu->accel = g_new0(AccelCPUState, 1);
-    mshv_arch_init_vcpu(cpu);
 
     ret = mshv_create_vcpu(vm_fd, vp_index, &cpu->accel->cpufd);
     if (ret < 0) {
         return -1;
     }
+
+    mshv_arch_init_vcpu(cpu);
 
     cpu->accel->dirty = true;
 
