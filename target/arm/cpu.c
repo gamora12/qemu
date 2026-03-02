@@ -1145,6 +1145,10 @@ static void arm_cpu_initfn(Object *obj)
         /* TCG and HVF implement PSCI 1.1 */
         cpu->psci_version = QEMU_PSCI_VERSION_1_1;
     }
+    else if (mshv_enabled()) {
+        /* MSHV implements PSCI 1.3 */
+        cpu->psci_version = QEMU_PSCI_VERSION_1_3;
+    }
 }
 
 /*
