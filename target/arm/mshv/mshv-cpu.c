@@ -796,3 +796,18 @@ void mshv_arm_set_cpu_features_from_host(ARMCPU *cpu)
     cpu->reset_sctlr = arm_host_cpu_features.reset_sctlr;
     printf("MSHV: Successfully set CPU features from host\n");
 }
+
+void mshv_init_mmio_emu(void) 
+{
+
+}
+
+void mshv_arch_amend_proc_features(
+    union hv_partition_synthetic_processor_features *features)
+{
+
+}
+int mshv_arch_post_init_vm(int vm_fd)
+{
+    return 0;
+}

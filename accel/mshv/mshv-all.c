@@ -111,96 +111,22 @@ static int resume_vm(int vm_fd)
     return 0;
 }
 
-/*
- * Query host CPU features from the hypervisor using partition properties.
- * Uses partition_id = -1 (self/host) to query the physical host's features.
- * This can be called on mshv_fd before creating a partition.
- */
-static int get_host_processor_features(int mshv_fd,
-                                        union hv_partition_processor_features *features)
-{
-    int ret;
-
-    struct hv_input_get_partition_property in = {0};
-    struct hv_output_get_partition_property out = {0};
-
-    struct mshv_root_hvcall args = {0};
-
-    /* Query PROCESSOR_FEATURES0 (bank 0) */
-    in.partition_id = -1ULL; /* Self/host */
-    in.property_code = HV_PARTITION_PROPERTY_PROCESSOR_FEATURES0;
-
-    args.code = HVCALL_GET_PARTITION_PROPERTY;
-    args.in_sz = sizeof(in);
-    args.in_ptr = (uint64_t)&in;
-    args.out_sz = sizeof(out);
-    args.out_ptr = (uint64_t)&out;
-
-    ret = mshv_hvcall(mshv_fd, &args);
-
-    if (ret < 0) {
-        error_report("Failed to get host processor features bank 0");
-        return -1;
-    }
-
-    features->as_uint64[0] = out.property_value;
-
-    /* Query PROCESSOR_FEATURES1 (bank 1) */
-    in.property_code = HV_PARTITION_PROPERTY_PROCESSOR_FEATURES1;
-    memset(&out, 0, sizeof(out));
-
-    ret = mshv_hvcall(mshv_fd, &args);
-
-    if (ret < 0) {
-        error_report("Failed to get host processor features bank 1");
-        return -1;
-    }
-
-    features->as_uint64[1] = out.property_value;
-    // Print the enabled features
-    printf("MSHV: Host CPU features (enabled): bank0=0x%lx bank1=0x%lx\n",
-        features->as_uint64[0], features->as_uint64[1]);
-    return 0;
-}
-
 static int create_partition(int mshv_fd, int *vm_fd)
 {
-    // Debug: print struct size
-    printf("sizeof(struct mshv_create_partition_v2) = %zu\n", sizeof(struct mshv_create_partition_v2));
-
-    // Debug: hex dump of struct before ioctl
-    
     int ret;
-    struct mshv_create_partition_v2 args = {0};
-    printf("Size of mshv_create_partition_v2: %zu\n", sizeof(args));
-    union hv_partition_processor_features host_features = {0};
+    struct mshv_create_partition args = {0};
 
     /* Initialize pt_flags with the desired features */
-    uint64_t pt_flags = (1ULL << MSHV_PT_BIT_GPA_SUPER_PAGES) |
-                        (1ULL << MSHV_PT_BIT_CPU_AND_XSAVE_FEATURES);
+    uint64_t pt_flags = (1ULL << MSHV_PT_BIT_LAPIC) |
+                        (1ULL << MSHV_PT_BIT_X2APIC) | 
+                        (1ULL << MSHV_PT_BIT_GPA_SUPER_PAGES);
 
     /* Set default isolation type */
     uint64_t pt_isolation = MSHV_PT_ISOLATION_NONE;
 
     args.pt_flags = pt_flags;
     args.pt_isolation = pt_isolation;
-    args.pt_num_cpu_fbanks = MSHV_NUM_CPU_FEATURES_BANKS;
 
-    ret = get_host_processor_features(mshv_fd, &host_features);
-    if (ret < 0) {
-        return -1;
-    }
-
-    args.pt_cpu_fbanks[0] = ~host_features.as_uint64[0];
-    args.pt_cpu_fbanks[1] = ~host_features.as_uint64[1];
-
-    unsigned char *p = (unsigned char *)&args;
-    printf("mshv_create_partition_v2 hex dump:\n");
-    for (size_t i = 0; i < sizeof(struct mshv_create_partition_v2); ++i) {
-        printf("%02x ", p[i]);
-        if ((i+1) % 16 == 0) printf("\n");
-    }
-    printf("\n");
     ret = ioctl(mshv_fd, MSHV_CREATE_PARTITION, &args);
     if (ret < 0) {
         error_report("Failed to create partition: %s", strerror(errno));
@@ -263,28 +189,6 @@ static int initialize_vm(int vm_fd)
     return 0;
 }
 
-static int set_partition_prop(int vm_fd, uint32_t prop_code,
-                              uint64_t prop_value)
-{
-    int ret;
-    struct hv_input_set_partition_property in = {0};
-    in.property_code = prop_code;
-    in.property_value = prop_value;
-
-    struct mshv_root_hvcall args = {0};
-    args.code = HVCALL_SET_PARTITION_PROPERTY;
-    args.in_sz = sizeof(in);
-    args.in_ptr = (uint64_t)&in;
-
-    ret = mshv_hvcall(vm_fd, &args);
-    if (ret < 0) {
-        error_report("Failed to set partition property code %u", prop_code);
-        return -1;
-    }
-
-    return 0;
-}
-
 static int create_vm(int mshv_fd, int *vm_fd)
 {
     int ret = create_partition(mshv_fd, vm_fd);
@@ -296,23 +200,6 @@ static int create_vm(int mshv_fd, int *vm_fd)
     if (ret < 0) {
         return -1;
     }
-
-    // init gic related stuff
-    set_partition_prop(*vm_fd,
-                        HV_PARTITION_PROPERTY_GICD_BASE_ADDRESS,
-                        0x08000000);
-    set_partition_prop(*vm_fd,
-                        HV_PARTITION_PROPERTY_GITS_TRANSLATER_BASE_ADDRESS,
-                        0x08080000);
-    set_partition_prop(*vm_fd,
-                        HV_PARTITION_PROPERTY_GIC_LPI_INT_ID_BITS,
-                        0);
-    set_partition_prop(*vm_fd,
-                        HV_PARTITION_PROPERTY_GIC_PPI_OVERFLOW_INTERRUPT_FROM_CNTV,
-                        ARCH_TIMER_VIRT_IRQ);
-    set_partition_prop(*vm_fd,
-                        HV_PARTITION_PROPERTY_GIC_PPI_PERFORMANCE_MONITORS_INTERRUPT,
-                        VIRTUAL_PMU_IRQ);
 
     ret = initialize_vm(*vm_fd);
     if (ret < 0) {
@@ -614,8 +501,6 @@ static int mshv_cpu_exec(CPUState *cpu)
             }
             cpu->accel->dirty = false;
         }
-        // uint8_t vp_index = cpu->cpu_index;
-        // printf("debug: running vcpu vp_index = %d with fd %d\n", vp_index, cpu->accel->cpufd);
         ret = mshv_run_vcpu(mshv_state->vm, cpu, &mshv_msg, &exit_reason);
         if (ret < 0) {
             error_report("Failed to run on vcpu %d", cpu->cpu_index);
