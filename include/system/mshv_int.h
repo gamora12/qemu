@@ -79,6 +79,7 @@ typedef enum MshvVmExit {
 } MshvVmExit;
 
 void mshv_init_mmio_emu(void);
+int init_mshv(int *mshv_fd);
 int mshv_create_vcpu(int vm_fd, uint8_t vp_index, int *cpu_fd);
 void mshv_remove_vcpu(int vm_fd, int cpu_fd);
 int mshv_configure_vcpu(const CPUState *cpu, const MshvFPU *fpu, uint64_t xcr0);
