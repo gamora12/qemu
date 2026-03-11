@@ -25,7 +25,7 @@ struct hv_input_get_partition_property {
 };
 
 struct hv_output_get_partition_property {
-	uint64_t property_value;
+    uint64_t property_value;
 };
 
 union hv_partition_synthetic_processor_features {
