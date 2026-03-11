@@ -74,7 +74,6 @@ static enum hv_register_name STANDARD_REGISTER_NAMES[32] = {
 
 static int set_standard_regs(const CPUState *cpu)
 {
-
     size_t n_regs = ARRAY_SIZE(STANDARD_REGISTER_NAMES);
     struct hv_register_assoc *assocs;
     int ret;
@@ -88,8 +87,9 @@ static int set_standard_regs(const CPUState *cpu)
         assocs[i].value.reg64 = env->xregs[i];
     }
 
-    assocs[31].name = STANDARD_REGISTER_NAMES[31];
-    assocs[31].value.reg64 = env->pc;
+    /* Last register is the program counter */
+    assocs[n_regs - 1].name = STANDARD_REGISTER_NAMES[n_regs - 1];
+    assocs[n_regs - 1].value.reg64 = env->pc;
 
     ret = mshv_set_generic_regs(cpu, assocs, n_regs);
     if (ret < 0) {
@@ -107,10 +107,13 @@ static void populate_standard_regs(const hv_register_assoc *assocs,
                                    CPUARMState *env)
 {
     size_t n_regs = ARRAY_SIZE(STANDARD_REGISTER_NAMES);
+
     for (size_t i = 0; i < n_regs - 1; i++) {
         env->xregs[i] = assocs[i].value.reg64;
     }
-    env->pc = assocs[31].value.reg64;
+
+    /* Last register is the program counter */
+    env->pc = assocs[n_regs - 1].value.reg64;
 }
 
 int mshv_load_regs(CPUState *cpu)
