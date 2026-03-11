@@ -190,21 +190,21 @@ union hv_partition_synthetic_processor_features {
 #endif
 
 #if defined(__aarch64__)
-    /* Register intercepts supported in V1. As more registers are supported in future
-        * releases, new bits will be added here to prevent migration between incompatible hosts.
-        *
-        * List of registers supported in V1:
-        * 1. TPIDRRO_EL0
-        * 2. TPIDR_EL1
-        * 3. SCTLR_EL1 - Supports write intercept mask.
-        * 4. VBAR_EL1
-        * 5. TCR_EL1 - Supports write intercept mask.
-        * 6. MAIR_EL1 - Supports write intercept mask.
-        * 7. CPACR_EL1 - Supports write intercept mask.
-        * 8. CONTEXTIDR_EL1
-        * 9. PAuth keys (total 10 registers)
-        * 10. HvArm64RegisterSyntheticException
-        */
+        /* Register intercepts supported in V1. As more registers are supported in future
+         * releases, new bits will be added here to prevent migration between incompatible hosts.
+         *
+         * List of registers supported in V1:
+         * 1. TPIDRRO_EL0
+         * 2. TPIDR_EL1
+         * 3. SCTLR_EL1 - Supports write intercept mask.
+         * 4. VBAR_EL1
+         * 5. TCR_EL1 - Supports write intercept mask.
+         * 6. MAIR_EL1 - Supports write intercept mask.
+         * 7. CPACR_EL1 - Supports write intercept mask.
+         * 8. CONTEXTIDR_EL1
+         * 9. PAuth keys (total 10 registers)
+         * 10. HvArm64RegisterSyntheticException
+         */
     uint64_t register_intercepts_v1:1;
 #else
 		uint64_t reserved_z36:1;
@@ -214,9 +214,9 @@ union hv_partition_synthetic_processor_features {
         uint64_t wake_vps:1;
 
         /* HvCallGet/SetVpRegisters is supported.
-            * Corresponds to AccessVpRegisters privilege.
-            * This feature only affects exo partitions.
-            */
+         * Corresponds to AccessVpRegisters privilege.
+         * This feature only affects exo partitions.
+         */
         uint64_t access_vp_regs:1;
 
 #if defined(__aarch64__)
@@ -227,11 +227,11 @@ union hv_partition_synthetic_processor_features {
 #endif /* __aarch64__ */
 
         /* Management VTL synic support is allowed.
-            * Corresponds to the ManagementVtlSynicSupport privilege.
-            */
+         * Corresponds to the ManagementVtlSynicSupport privilege.
+         */
         uint64_t management_vtl_synic_support:1;
 
-#if defined (__x86_64__)
+#if defined(__x86_64__)
         /* Hypervisor supports guest mechanism to signal pending interrupts to paravisor. */
         uint64_t proxy_interrupt_doorbell_support:1;
 #else
