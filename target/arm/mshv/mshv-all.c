@@ -546,6 +546,7 @@ static bool mshv_arm_get_host_cpu_features(ARMHostCPUFeatures *ahcf)
     int vm_fd = mshv_state->vm;
     int i, ret;
     bool success = true;
+    gchar *contents = NULL;
 
     const struct {
         hv_register_name name;
@@ -590,11 +591,12 @@ static bool mshv_arm_get_host_cpu_features(ARMHostCPUFeatures *ahcf)
         ahcf->isar.idregs[regs[i].isar_idx] = reg_values[i].reg64;
     }
 
-    /* Read the host MIDR_EL1 register */
-    asm volatile("mrs %0, midr_el1" : "=r" (ahcf->midr));
-
-    if (ahcf->midr == 0) {
-        error_report("Failed to read host MIDR");
+    /* Read MIDR_EL1 from sysfs */
+    if (g_file_get_contents("/sys/devices/system/cpu/cpu0/regs/identification/midr_el1",
+                            &contents, NULL, NULL)) {
+        ahcf->midr = g_ascii_strtoull(contents, NULL, 0);
+    } else {
+        error_report("Failed to read MIDR_EL1 from sysfs");
         success = false;
         goto out;
     }
@@ -624,6 +626,7 @@ static bool mshv_arm_get_host_cpu_features(ARMHostCPUFeatures *ahcf)
 
 out:
     close(mshv_fd);
+    g_free(contents);
     g_free(reg_names);
     g_free(reg_values);
     return success;
