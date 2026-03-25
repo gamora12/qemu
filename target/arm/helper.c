@@ -8,6 +8,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/bswap.h"
 #include "trace.h"
 #include "cpu.h"
 #include "internals.h"
@@ -34,6 +35,7 @@
 #endif
 #include "cpregs.h"
 #include "target/arm/gtimer.h"
+#include "target/arm/helper.h"
 #include "qemu/plugin.h"
 
 static void switch_mode(CPUARMState *env, int mode);
@@ -9128,6 +9130,78 @@ static void arm_cpu_do_interrupt_aarch32(CPUState *cs)
     }
 
     take_aarch32_exception(env, new_mode, mask, offset, addr);
+}
+
+/*
+ * Emulate a data abort syndrome for MMIO/guest memory access
+ */
+int accel_emulate_with_syndrome(CPUState *cpu, uint64_t syndrome, uint64_t gpa,
+                                AccelSyndromeOps *ops)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    int ret;
+
+    // Decode syndrome fields (see ARM ARM D13.2.35)
+    uint32_t iss = syndrome & 0x1ffffff;
+    bool isv = (iss >> 24) & 1;
+    bool wnr = (iss >> 6) & 1;
+    bool sse = (iss >> 21) & 1;
+    uint32_t sas = (iss >> 22) & 3;
+    uint64_t len = 1ULL << sas;
+    uint32_t srt = (iss >> 16) & 0x1f;
+    bool sf = (iss >> 15) & 1;
+
+    if (!isv) {
+        error_report("Invalid ESR EL2 ISV field");
+        return -1;
+    }
+
+    ret = ops->load_regs(cpu);
+    if (ret < 0) {
+        error_report("Failed to load registers");
+        return -1;
+    }
+
+    if (wnr) {
+        uint8_t data[8];
+        uint64_t val = srt < 31 ? ops->get_reg(cpu, srt) : 0ULL;
+        val = cpu_to_le64(val);
+        memcpy(data, &val, sizeof(val));
+        ret = ops->mem_write(gpa, data, len, false);
+        if (ret < 0) {
+            error_report("Failed to write guest memory");
+            return -1;
+        }
+    } else {
+        uint8_t data[8] = {0};
+        ret = ops->mem_read(gpa, data, len, false, false);
+        if (ret < 0) {
+            error_report("Failed to read guest memory");
+            return -1;
+        }
+        uint64_t val;
+        memcpy(&val, data, sizeof(val));
+        val = le64_to_cpu(val);
+        if (sse) {
+            uint64_t shift = 64 - (len * 8);
+            val = (((int64_t)val << shift) >> shift);
+            if (!sf) {
+                val &= 0xffffffff;
+            }
+        }
+        ops->set_reg(cpu, srt, val);
+    }
+
+    // Advance PC
+    env->pc += ((syndrome >> 25) & 1) ? 4 : 2;
+
+    ret = ops->store_regs(cpu);
+    if (ret < 0) {
+        error_report("failed to store registers");
+        return -1;
+    }
+    return 0;
 }
 
 static int aarch64_regnum(CPUARMState *env, int aarch32_reg)

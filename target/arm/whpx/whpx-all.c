@@ -27,6 +27,7 @@
 #include <winerror.h>
 
 #include "syndrome.h"
+#include "target/arm/helper.h"
 #include "target/arm/cpregs.h"
 #include "internals.h"
 
@@ -352,38 +353,39 @@ static void whpx_set_gp_reg(CPUState *cpu, int rt, uint64_t val)
     whpx_set_reg(cpu, reg, reg_val);
 }
 
+
+// WHPX-specific helpers for AccelSyndromeOps
+static int whpx_mem_read(uint64_t gpa, void *data, uint64_t len, bool atomic, bool debug) {
+    // atomic and debug are ignored for now
+    address_space_read(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED, data, len);
+    return 0;
+}
+static int whpx_mem_write(uint64_t gpa, const void *data, uint64_t len, bool atomic) {
+    address_space_write(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED, data, len);
+    return 0;
+}
+static uint64_t whpx_get_gp_reg_cb(CPUState *cpu, int reg_index) {
+    return whpx_get_gp_reg(cpu, reg_index);
+}
+static void whpx_set_gp_reg_cb(CPUState *cpu, int reg_index, uint64_t value) {
+    whpx_set_gp_reg(cpu, reg_index, value);
+}
+
 static int whpx_handle_mmio(CPUState *cpu, WHV_MEMORY_ACCESS_CONTEXT *ctx)
 {
     uint64_t syndrome = ctx->Syndrome;
-
-    bool isv = syndrome & ARM_EL_ISV;
-    bool iswrite = (syndrome >> 6) & 1;
-    bool sse = (syndrome >> 21) & 1;
-    uint32_t sas = (syndrome >> 22) & 3;
-    uint32_t len = 1 << sas;
-    uint32_t srt = (syndrome >> 16) & 0x1f;
     uint32_t cm = (syndrome >> 8) & 0x1;
-    uint64_t val = 0;
-
     assert(!cm);
-    assert(isv);
 
-    if (iswrite) {
-        val = whpx_get_gp_reg(cpu, srt);
-        address_space_write(&address_space_memory,
-                            ctx->Gpa,
-                            MEMTXATTRS_UNSPECIFIED, &val, len);
-    } else {
-        address_space_read(&address_space_memory,
-                           ctx->Gpa,
-                           MEMTXATTRS_UNSPECIFIED, &val, len);
-        if (sse) {
-            val = sextract64(val, 0, len * 8);
-        }
-        whpx_set_gp_reg(cpu, srt, val);
-    }
-
-    return 0;
+    AccelSyndromeOps ops = {
+        .load_regs = whpx_get_registers,
+        .store_regs = whpx_set_registers,
+        .mem_read = whpx_mem_read,
+        .mem_write = whpx_mem_write,
+        .get_reg = whpx_get_gp_reg_cb,
+        .set_reg = whpx_set_gp_reg_cb,
+    };
+    return accel_emulate_with_syndrome(cpu, ctx->Syndrome, ctx->Gpa, &ops);
 }
 
 static void whpx_psci_cpu_off(ARMCPU *arm_cpu)

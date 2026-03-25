@@ -20,7 +20,9 @@
 #include "system/cpus.h"
 #include "target/arm/cpu.h"
 #include "target/arm/internals.h"
+
 #include "target/arm/mshv_arm.h"
+#include "target/arm/helper.h"
 
 #include "system/mshv.h"
 #include "system/mshv_int.h"
@@ -232,87 +234,43 @@ int mshv_store_regs(CPUState *cpu)
     return 0;
 }
 
-static int emulate_with_syndrome(CPUState *cpu,
-                                 struct hv_arm64_memory_intercept_message *info)
-{
+static int mshv_mem_read(uint64_t gpa, void *data, uint64_t len, bool atomic, bool debug) {
+    return mshv_guest_mem_read(gpa, data, len, atomic, debug);
+}
+static int mshv_mem_write(uint64_t gpa, const void *data, uint64_t len, bool atomic) {
+    return mshv_guest_mem_write(gpa, data, len, atomic);
+}
+static uint64_t mshv_get_reg(CPUState *cpu, int reg_index) {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
     CPUARMState *env = &arm_cpu->env;
-    int ret;
-    EsrEl2 syndrome = { 0 };
-    IssDataAbort iss = { 0 };
-    uint64_t gpa = info->guest_physical_address;
-    uint64_t len, reg_index;
-    bool sign_extend;
+    return reg_index < 31 ? env->xregs[reg_index] : 0ULL;
+}
+static void mshv_set_reg(CPUState *cpu, int reg_index, uint64_t value) {
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    if (reg_index < 31) {
+        env->xregs[reg_index] = value;
+    }
+}
 
-    syndrome.raw = info->syndrome;
-
+static int emulate_with_syndrome(CPUState *cpu, struct hv_arm64_memory_intercept_message *info)
+{
+    EsrEl2 syndrome = { .raw = info->syndrome };
     if (!(syndrome.ec == data_abort_lower || syndrome.ec == data_abort)) {
         error_report("Unknown exception class 0x%x\n", syndrome.ec);
         return -1;
     }
 
-    iss.raw = syndrome.iss;
-    if (!iss.isv) {
-        error_report("Invalid ESR EL2 ISV field\n");
-        return -1;
-    }
+    AccelSyndromeOps ops = {
+        .load_regs = mshv_load_regs,
+        .store_regs = mshv_store_regs,
+        .mem_read = mshv_mem_read,
+        .mem_write = mshv_mem_write,
+        .get_reg = mshv_get_reg,
+        .set_reg = mshv_set_reg,
+    };
 
-    len = 1ULL << iss.sas;
-    sign_extend = iss.sse;
-    reg_index = iss.srt;
-
-    ret = mshv_load_regs(cpu);
-    if (ret < 0) {
-        error_report("Failed to load registers");
-        return -1;
-    }
-
-    if (iss.wnr) {
-        uint8_t data[8];
-        uint64_t val = reg_index < 31 ? env->xregs[reg_index] : 0ULL;
-
-        val = cpu_to_le64(val);
-
-        memcpy(data, &val, sizeof(val));
-        ret = mshv_guest_mem_write(gpa, data, len, false);
-        if (ret < 0) {
-            error_report("Failed to write guest memory");
-            return -1;
-        }
-    } else {
-        uint8_t data[8] = { 0 };
-
-        ret = mshv_guest_mem_read(gpa, data, len, false, false);
-        if (ret < 0) {
-            error_report("Failed to read guest memory");
-            return -1;
-        }
-
-        uint64_t val;
-        memcpy(&val, data, sizeof(val));
-
-        val = le64_to_cpu(val);
-
-        if (sign_extend) {
-            uint64_t shift = 64 - (len * 8);
-            val = (((int64_t)val << shift) >> shift);
-            if (!iss.sf) {
-                val &= 0xffffffff;
-            }
-        }
-
-        env->xregs[reg_index] = val;
-    }
-
-    env->pc += (syndrome.il == 1) ? 4 : 2;
-
-    ret = mshv_store_regs(cpu);
-    if (ret < 0) {
-        error_report("failed to store registers");
-        return -1;
-    }
-
-    return 0;
+    return accel_emulate_with_syndrome(cpu, info->syndrome, info->guest_physical_address, &ops);
 }
 
 static int handle_unmapped_mem(int vm_fd, CPUState *cpu,
