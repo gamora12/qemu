@@ -101,6 +101,43 @@ typedef enum {
     GCS_IT_GCSPOPX = 9,
 } GCSInstructionType;
 
+typedef union {
+    uint64_t raw;
+    struct {
+        uint32_t iss:25;
+        uint32_t il:1;
+        uint32_t ec:6;
+        uint32_t iss2:5;
+        uint32_t _rsvd:27;
+    } QEMU_PACKED;
+} EsrEl2;
+
+typedef union {
+    uint32_t raw;
+    struct {
+        uint32_t dfsc:6;
+        uint32_t wnr:1;
+        uint32_t s1ptw:1;
+        uint32_t cm:1;
+        uint32_t ea:1;
+        uint32_t fnv:1;
+        uint32_t set:2;
+        uint32_t vncr:1;
+        uint32_t ar:1;
+        uint32_t sf:1;
+        uint32_t srt:5;
+        uint32_t sse:1;
+        uint32_t sas:2;
+        uint32_t isv:1;
+        uint32_t _unused:7;
+    } QEMU_PACKED;
+} IssDataAbort;
+
+typedef enum {
+    data_abort_lower = 36,
+    data_abort = 37,
+} ExceptionClass;
+
 #define ARM_EL_EC_LENGTH 6
 #define ARM_EL_EC_SHIFT 26
 #define ARM_EL_IL_SHIFT 25
