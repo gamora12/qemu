@@ -28,6 +28,8 @@
 
 #include "syndrome.h"
 #include "target/arm/cpregs.h"
+#include "target/arm/helper.h"
+#include "target/arm/syndrome.h"
 #include "internals.h"
 
 #include "system/whpx-internal.h"
@@ -330,58 +332,24 @@ static void whpx_set_global_reg(WHV_REGISTER_NAME reg, WHV_REGISTER_VALUE val)
     }
 }
 
-static uint64_t whpx_get_gp_reg(CPUState *cpu, int rt)
-{
-    assert(rt <= 31);
-    if (rt == 31) {
-        return 0;
-    }
-    WHV_REGISTER_NAME reg = WHvArm64RegisterX0 + rt;
-    WHV_REGISTER_VALUE val;
-    whpx_get_reg(cpu, reg, &val);
-
-    return val.Reg64;
-}
-
-static void whpx_set_gp_reg(CPUState *cpu, int rt, uint64_t val)
-{
-    assert(rt < 31);
-    WHV_REGISTER_NAME reg = WHvArm64RegisterX0 + rt;
-    WHV_REGISTER_VALUE reg_val = {.Reg64 = val};
-
-    whpx_set_reg(cpu, reg, reg_val);
-}
-
 static int whpx_handle_mmio(CPUState *cpu, WHV_MEMORY_ACCESS_CONTEXT *ctx)
 {
-    uint64_t syndrome = ctx->Syndrome;
-
-    bool isv = syndrome & ARM_EL_ISV;
-    bool iswrite = (syndrome >> 6) & 1;
-    bool sse = (syndrome >> 21) & 1;
-    uint32_t sas = (syndrome >> 22) & 3;
-    uint32_t len = 1 << sas;
-    uint32_t srt = (syndrome >> 16) & 0x1f;
-    uint32_t cm = (syndrome >> 8) & 0x1;
-    uint64_t val = 0;
+    int ret = 0;
+    EsrEl2 esr = { .raw = ctx->Syndrome };
+    uint32_t cm = (esr.iss >> 8) & 0x1;
 
     assert(!cm);
-    assert(isv);
 
-    if (iswrite) {
-        val = whpx_get_gp_reg(cpu, srt);
-        address_space_write(&address_space_memory,
-                            ctx->Gpa,
-                            MEMTXATTRS_UNSPECIFIED, &val, len);
-    } else {
-        address_space_read(&address_space_memory,
-                           ctx->Gpa,
-                           MEMTXATTRS_UNSPECIFIED, &val, len);
-        if (sse) {
-            val = sextract64(val, 0, len * 8);
-        }
-        whpx_set_gp_reg(cpu, srt, val);
+    whpx_get_registers(cpu, WHPX_LEVEL_RUNTIME_STATE);
+
+    ret = arm_emulate_mmio(cpu, esr, ctx->Gpa);
+    if (ret < 0) {
+        error_report("WHPX: Failed to handle MMIO, syndrome=0x%llx, gpa=0x%llx",
+                     esr.raw, ctx->Gpa);
+        return -1;
     }
+
+    whpx_set_registers(cpu, WHPX_LEVEL_RUNTIME_STATE);
 
     return 0;
 }
