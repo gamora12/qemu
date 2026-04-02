@@ -855,10 +855,7 @@ if get_option('kvm').allowed() and host_os == 'linux'
   accelerators += 'CONFIG_KVM'
 endif
 
-if get_option('mshv').allowed() and host_os == 'linux'
-  if get_option('mshv').enabled() and not (host_machine.cpu() in [ 'x86_64', 'aarch64' ])
-    error('The mshv accelerator requires an x86_64 or aarch64 host')
-  endif
+if get_option('mshv').allowed() and host_os == 'linux' and host_machine.cpu() in ['x86_64', 'aarch64']
   accelerators += 'CONFIG_MSHV'
 endif
 
