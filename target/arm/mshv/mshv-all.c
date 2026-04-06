@@ -354,6 +354,7 @@ int mshv_run_vcpu(int vm_fd, CPUState *cpu, hv_message *msg, MshvVmExit *exit)
     case HVMSG_UNRECOVERABLE_EXCEPTION:
         *exit = MshvVmExitShutdown;
         break;
+    case HVMSG_GPA_INTERCEPT:
     case HVMSG_UNMAPPED_GPA:
         ret = handle_unmapped_mem(vm_fd, cpu, msg, exit);
         if (ret < 0) {
