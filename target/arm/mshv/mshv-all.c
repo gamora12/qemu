@@ -37,88 +37,296 @@ typedef struct ARMHostCPUFeatures {
 
 static ARMHostCPUFeatures arm_host_cpu_features;
 
-static const enum hv_register_name STANDARD_REGISTER_NAMES[32] = {
-    HV_ARM64_REGISTER_X0,
-    HV_ARM64_REGISTER_X1,
-    HV_ARM64_REGISTER_X2,
-    HV_ARM64_REGISTER_X3,
-    HV_ARM64_REGISTER_X4,
-    HV_ARM64_REGISTER_X5,
-    HV_ARM64_REGISTER_X6,
-    HV_ARM64_REGISTER_X7,
-    HV_ARM64_REGISTER_X8,
-    HV_ARM64_REGISTER_X9,
-    HV_ARM64_REGISTER_X10,
-    HV_ARM64_REGISTER_X11,
-    HV_ARM64_REGISTER_X12,
-    HV_ARM64_REGISTER_X13,
-    HV_ARM64_REGISTER_X14,
-    HV_ARM64_REGISTER_X15,
-    HV_ARM64_REGISTER_X16,
-    HV_ARM64_REGISTER_X17,
-    HV_ARM64_REGISTER_X18,
-    HV_ARM64_REGISTER_X19,
-    HV_ARM64_REGISTER_X20,
-    HV_ARM64_REGISTER_X21,
-    HV_ARM64_REGISTER_X22,
-    HV_ARM64_REGISTER_X23,
-    HV_ARM64_REGISTER_X24,
-    HV_ARM64_REGISTER_X25,
-    HV_ARM64_REGISTER_X26,
-    HV_ARM64_REGISTER_X27,
-    HV_ARM64_REGISTER_X28,
-    HV_ARM64_REGISTER_FP,
-    HV_ARM64_REGISTER_LR,
-    HV_ARM64_REGISTER_PC,
+/*
+ * Simple 64-bit registers that map directly to a CPUARMState field.
+ * Modelled after target/arm/hvf/hvf.c's hvf_reg_match[].
+ */
+typedef struct MshvRegMatch {
+    uint32_t hv_reg;
+    size_t offset;
+} MshvRegMatch;
+
+static const MshvRegMatch mshv_reg_match[] = {
+    { HV_ARM64_REGISTER_X0,  offsetof(CPUARMState, xregs[0]) },
+    { HV_ARM64_REGISTER_X1,  offsetof(CPUARMState, xregs[1]) },
+    { HV_ARM64_REGISTER_X2,  offsetof(CPUARMState, xregs[2]) },
+    { HV_ARM64_REGISTER_X3,  offsetof(CPUARMState, xregs[3]) },
+    { HV_ARM64_REGISTER_X4,  offsetof(CPUARMState, xregs[4]) },
+    { HV_ARM64_REGISTER_X5,  offsetof(CPUARMState, xregs[5]) },
+    { HV_ARM64_REGISTER_X6,  offsetof(CPUARMState, xregs[6]) },
+    { HV_ARM64_REGISTER_X7,  offsetof(CPUARMState, xregs[7]) },
+    { HV_ARM64_REGISTER_X8,  offsetof(CPUARMState, xregs[8]) },
+    { HV_ARM64_REGISTER_X9,  offsetof(CPUARMState, xregs[9]) },
+    { HV_ARM64_REGISTER_X10, offsetof(CPUARMState, xregs[10]) },
+    { HV_ARM64_REGISTER_X11, offsetof(CPUARMState, xregs[11]) },
+    { HV_ARM64_REGISTER_X12, offsetof(CPUARMState, xregs[12]) },
+    { HV_ARM64_REGISTER_X13, offsetof(CPUARMState, xregs[13]) },
+    { HV_ARM64_REGISTER_X14, offsetof(CPUARMState, xregs[14]) },
+    { HV_ARM64_REGISTER_X15, offsetof(CPUARMState, xregs[15]) },
+    { HV_ARM64_REGISTER_X16, offsetof(CPUARMState, xregs[16]) },
+    { HV_ARM64_REGISTER_X17, offsetof(CPUARMState, xregs[17]) },
+    { HV_ARM64_REGISTER_X18, offsetof(CPUARMState, xregs[18]) },
+    { HV_ARM64_REGISTER_X19, offsetof(CPUARMState, xregs[19]) },
+    { HV_ARM64_REGISTER_X20, offsetof(CPUARMState, xregs[20]) },
+    { HV_ARM64_REGISTER_X21, offsetof(CPUARMState, xregs[21]) },
+    { HV_ARM64_REGISTER_X22, offsetof(CPUARMState, xregs[22]) },
+    { HV_ARM64_REGISTER_X23, offsetof(CPUARMState, xregs[23]) },
+    { HV_ARM64_REGISTER_X24, offsetof(CPUARMState, xregs[24]) },
+    { HV_ARM64_REGISTER_X25, offsetof(CPUARMState, xregs[25]) },
+    { HV_ARM64_REGISTER_X26, offsetof(CPUARMState, xregs[26]) },
+    { HV_ARM64_REGISTER_X27, offsetof(CPUARMState, xregs[27]) },
+    { HV_ARM64_REGISTER_X28, offsetof(CPUARMState, xregs[28]) },
+    { HV_ARM64_REGISTER_FP,  offsetof(CPUARMState, xregs[29]) },
+    { HV_ARM64_REGISTER_LR,  offsetof(CPUARMState, xregs[30]) },
+    { HV_ARM64_REGISTER_PC,  offsetof(CPUARMState, pc) },
+    /*
+     * QEMU keeps the current SP in xregs[31] as well; this is kept in sync
+     * with sp_el[] via aarch64_save_sp()/aarch64_restore_sp() below.
+     */
+    { HV_ARM64_REGISTER_SP_EL0,  offsetof(CPUARMState, sp_el[0]) },
+    { HV_ARM64_REGISTER_SP_EL1,  offsetof(CPUARMState, sp_el[1]) },
+    { HV_ARM64_REGISTER_ELR_EL1, offsetof(CPUARMState, elr_el[1]) },
 };
 
-static int set_standard_regs(const CPUState *cpu)
+/*
+ * EL0/EL1 system (control) registers that map directly to a CPUARMState
+ * cp15 field. These are the mshv analog of the registers KVM migrates
+ * opaquely via its KVM_GET_REG_LIST cpreg list.
+ *
+ * AFSR0_EL1, AFSR1_EL1 and AMAIR_EL1 are intentionally omitted: QEMU models
+ * them as RAZ/WI and keeps no backing state for them.
+ */
+static const MshvRegMatch mshv_sysreg_match[] = {
+    { HV_ARM64_REGISTER_SCTLR_EL1,      offsetof(CPUARMState, cp15.sctlr_el[1]) },
+    { HV_ARM64_REGISTER_CPACR_EL1,      offsetof(CPUARMState, cp15.cpacr_el1) },
+    { HV_ARM64_REGISTER_TTBR0_EL1,      offsetof(CPUARMState, cp15.ttbr0_el[1]) },
+    { HV_ARM64_REGISTER_TTBR1_EL1,      offsetof(CPUARMState, cp15.ttbr1_el[1]) },
+    { HV_ARM64_REGISTER_TCR_EL1,        offsetof(CPUARMState, cp15.tcr_el[1]) },
+    { HV_ARM64_REGISTER_ESR_EL1,        offsetof(CPUARMState, cp15.esr_el[1]) },
+    { HV_ARM64_REGISTER_FAR_EL1,        offsetof(CPUARMState, cp15.far_el[1]) },
+    { HV_ARM64_REGISTER_PAR_EL1,        offsetof(CPUARMState, cp15.par_el[1]) },
+    { HV_ARM64_REGISTER_MAIR_EL1,       offsetof(CPUARMState, cp15.mair_el[1]) },
+    { HV_ARM64_REGISTER_VBAR_EL1,       offsetof(CPUARMState, cp15.vbar_el[1]) },
+    { HV_ARM64_REGISTER_CONTEXTIDR_EL1, offsetof(CPUARMState, cp15.contextidr_el[1]) },
+    { HV_ARM64_REGISTER_TPIDR_EL1,      offsetof(CPUARMState, cp15.tpidr_el[1]) },
+    { HV_ARM64_REGISTER_TPIDR_EL0,      offsetof(CPUARMState, cp15.tpidr_el[0]) },
+    { HV_ARM64_REGISTER_TPIDRRO_EL0,    offsetof(CPUARMState, cp15.tpidrro_el[0]) },
+    { HV_ARM64_REGISTER_CSSELR_EL1,     offsetof(CPUARMState, cp15.csselr_el[1]) },
+    { HV_ARM64_REGISTER_MDSCR_EL1,      offsetof(CPUARMState, cp15.mdscr_el1) },
+    { HV_ARM64_REGISTER_CNTKCTL_EL1,    offsetof(CPUARMState, cp15.c14_cntkctl) },
+    { HV_ARM64_REGISTER_CNTVOFF_EL2,    offsetof(CPUARMState, cp15.cntvoff_el2) },
+    { HV_ARM64_REGISTER_CNTV_CTL_EL0,
+      offsetof(CPUARMState, cp15.c14_timer[GTIMER_VIRT].ctl) },
+    { HV_ARM64_REGISTER_CNTV_CVAL_EL0,
+      offsetof(CPUARMState, cp15.c14_timer[GTIMER_VIRT].cval) },
+};
+
+/* SIMD/FP registers Q0..Q31 map to the low 128 bits of vfp.zregs[i]. */
+static const uint32_t mshv_fpreg_names[32] = {
+    HV_ARM64_REGISTER_Q0,  HV_ARM64_REGISTER_Q1,  HV_ARM64_REGISTER_Q2,
+    HV_ARM64_REGISTER_Q3,  HV_ARM64_REGISTER_Q4,  HV_ARM64_REGISTER_Q5,
+    HV_ARM64_REGISTER_Q6,  HV_ARM64_REGISTER_Q7,  HV_ARM64_REGISTER_Q8,
+    HV_ARM64_REGISTER_Q9,  HV_ARM64_REGISTER_Q10, HV_ARM64_REGISTER_Q11,
+    HV_ARM64_REGISTER_Q12, HV_ARM64_REGISTER_Q13, HV_ARM64_REGISTER_Q14,
+    HV_ARM64_REGISTER_Q15, HV_ARM64_REGISTER_Q16, HV_ARM64_REGISTER_Q17,
+    HV_ARM64_REGISTER_Q18, HV_ARM64_REGISTER_Q19, HV_ARM64_REGISTER_Q20,
+    HV_ARM64_REGISTER_Q21, HV_ARM64_REGISTER_Q22, HV_ARM64_REGISTER_Q23,
+    HV_ARM64_REGISTER_Q24, HV_ARM64_REGISTER_Q25, HV_ARM64_REGISTER_Q26,
+    HV_ARM64_REGISTER_Q27, HV_ARM64_REGISTER_Q28, HV_ARM64_REGISTER_Q29,
+    HV_ARM64_REGISTER_Q30, HV_ARM64_REGISTER_Q31,
+};
+
+/*
+ * Store the general-purpose, PC, SP, ELR, PSTATE and SPSR_EL1 state from the
+ * CPUARMState into the mshv partition.
+ */
+static int store_core_regs(const CPUState *cpu)
 {
-    size_t n_regs = ARRAY_SIZE(STANDARD_REGISTER_NAMES);
-    struct hv_register_assoc assocs[ARRAY_SIZE(STANDARD_REGISTER_NAMES)] = {};
-    int ret;
     ARMCPU *arm_cpu = ARM_CPU(cpu);
     CPUARMState *env = &arm_cpu->env;
+    struct hv_register_assoc assocs[ARRAY_SIZE(mshv_reg_match) + 2] = {};
+    size_t n = 0;
+    int ret;
 
-    for (size_t i = 0; i < n_regs - 1; i++) {
-        assocs[i].name = STANDARD_REGISTER_NAMES[i];
-        assocs[i].value.reg64 = env->xregs[i];
+    /*
+     * Flush the current SP (kept in xregs[31]) into the sp_el[] banks so the
+     * table-driven copy below picks up the correct value.
+     */
+    aarch64_save_sp(env, arm_current_el(env));
+
+    for (size_t i = 0; i < ARRAY_SIZE(mshv_reg_match); i++) {
+        assocs[n].name = mshv_reg_match[i].hv_reg;
+        assocs[n].value.reg64 =
+            *(uint64_t *)((void *)env + mshv_reg_match[i].offset);
+        n++;
     }
 
-    /* Last register is the program counter */
-    assocs[n_regs - 1].name = STANDARD_REGISTER_NAMES[n_regs - 1];
-    assocs[n_regs - 1].value.reg64 = env->pc;
+    assocs[n].name = HV_ARM64_REGISTER_PSTATE;
+    assocs[n].value.reg64 = pstate_read(env);
+    n++;
 
-    ret = mshv_set_generic_regs(cpu, assocs, n_regs);
+    assocs[n].name = HV_ARM64_REGISTER_SPSR_EL1;
+    assocs[n].value.reg64 = env->banked_spsr[aarch64_banked_spsr_index(1)];
+    n++;
+
+    ret = mshv_set_generic_regs(cpu, assocs, n);
     if (ret < 0) {
-        error_report("failed to set standard registers");
+        error_report("failed to set core registers");
         return -1;
     }
 
     return 0;
 }
 
-static int get_standard_regs(CPUState *cpu)
+static int load_core_regs(CPUState *cpu)
 {
-    size_t n_regs = ARRAY_SIZE(STANDARD_REGISTER_NAMES);
-    struct hv_register_assoc assocs[ARRAY_SIZE(STANDARD_REGISTER_NAMES)] = {};
-    int ret;
     ARMCPU *arm_cpu = ARM_CPU(cpu);
     CPUARMState *env = &arm_cpu->env;
+    struct hv_register_assoc assocs[ARRAY_SIZE(mshv_reg_match) + 2] = {};
+    size_t n_simple = ARRAY_SIZE(mshv_reg_match);
+    size_t n = 0;
+    uint64_t pstate;
+    int ret;
 
-    for (size_t i = 0; i < n_regs; i++) {
-        assocs[i].name = STANDARD_REGISTER_NAMES[i];
+    for (size_t i = 0; i < n_simple; i++) {
+        assocs[n++].name = mshv_reg_match[i].hv_reg;
     }
-    ret = mshv_get_generic_regs(cpu, assocs, n_regs);
+    assocs[n++].name = HV_ARM64_REGISTER_PSTATE;
+    assocs[n++].name = HV_ARM64_REGISTER_SPSR_EL1;
+
+    ret = mshv_get_generic_regs(cpu, assocs, n);
     if (ret < 0) {
-        error_report("failed to get standard registers");
+        error_report("failed to get core registers");
         return -1;
     }
 
-    for (size_t i = 0; i < n_regs - 1; i++) {
-        env->xregs[i] = assocs[i].value.reg64;
+    for (size_t i = 0; i < n_simple; i++) {
+        *(uint64_t *)((void *)env + mshv_reg_match[i].offset) =
+            assocs[i].value.reg64;
     }
-    env->pc = assocs[n_regs - 1].value.reg64;
+
+    pstate = assocs[n_simple].value.reg64;
+    env->aarch64 = ((pstate & PSTATE_nRW) == 0);
+    pstate_write(env, pstate);
+
+    env->banked_spsr[aarch64_banked_spsr_index(1)] =
+        assocs[n_simple + 1].value.reg64;
+
+    /* Reload xregs[31] from the sp_el[] bank for the current EL. */
+    aarch64_restore_sp(env, arm_current_el(env));
+
+    return 0;
+}
+
+static int store_fp_regs(const CPUState *cpu)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    struct hv_register_assoc assocs[ARRAY_SIZE(mshv_fpreg_names) + 2] = {};
+    size_t n = 0;
+    int ret;
+
+    for (size_t i = 0; i < ARRAY_SIZE(mshv_fpreg_names); i++) {
+        assocs[n].name = mshv_fpreg_names[i];
+        assocs[n].value.reg128.low_part = env->vfp.zregs[i].d[0];
+        assocs[n].value.reg128.high_part = env->vfp.zregs[i].d[1];
+        n++;
+    }
+
+    assocs[n].name = HV_ARM64_REGISTER_FPCR;
+    assocs[n].value.reg64 = vfp_get_fpcr(env);
+    n++;
+
+    assocs[n].name = HV_ARM64_REGISTER_FPSR;
+    assocs[n].value.reg64 = vfp_get_fpsr(env);
+    n++;
+
+    ret = mshv_set_generic_regs(cpu, assocs, n);
+    if (ret < 0) {
+        error_report("failed to set FP/SIMD registers");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int load_fp_regs(CPUState *cpu)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    struct hv_register_assoc assocs[ARRAY_SIZE(mshv_fpreg_names) + 2] = {};
+    size_t n_simd = ARRAY_SIZE(mshv_fpreg_names);
+    size_t n = 0;
+    int ret;
+
+    for (size_t i = 0; i < n_simd; i++) {
+        assocs[n++].name = mshv_fpreg_names[i];
+    }
+    assocs[n++].name = HV_ARM64_REGISTER_FPCR;
+    assocs[n++].name = HV_ARM64_REGISTER_FPSR;
+
+    ret = mshv_get_generic_regs(cpu, assocs, n);
+    if (ret < 0) {
+        error_report("failed to get FP/SIMD registers");
+        return -1;
+    }
+
+    for (size_t i = 0; i < n_simd; i++) {
+        env->vfp.zregs[i].d[0] = assocs[i].value.reg128.low_part;
+        env->vfp.zregs[i].d[1] = assocs[i].value.reg128.high_part;
+    }
+
+    vfp_set_fpcr(env, assocs[n_simd].value.reg64);
+    vfp_set_fpsr(env, assocs[n_simd + 1].value.reg64);
+
+    return 0;
+}
+
+static int store_sys_regs(const CPUState *cpu)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    struct hv_register_assoc assocs[ARRAY_SIZE(mshv_sysreg_match)] = {};
+    size_t n_regs = ARRAY_SIZE(mshv_sysreg_match);
+    int ret;
+
+    for (size_t i = 0; i < n_regs; i++) {
+        assocs[i].name = mshv_sysreg_match[i].hv_reg;
+        assocs[i].value.reg64 =
+            *(uint64_t *)((void *)env + mshv_sysreg_match[i].offset);
+    }
+
+    ret = mshv_set_generic_regs(cpu, assocs, n_regs);
+    if (ret < 0) {
+        error_report("failed to set system registers");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int load_sys_regs(CPUState *cpu)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    struct hv_register_assoc assocs[ARRAY_SIZE(mshv_sysreg_match)] = {};
+    size_t n_regs = ARRAY_SIZE(mshv_sysreg_match);
+    int ret;
+
+    for (size_t i = 0; i < n_regs; i++) {
+        assocs[i].name = mshv_sysreg_match[i].hv_reg;
+    }
+
+    ret = mshv_get_generic_regs(cpu, assocs, n_regs);
+    if (ret < 0) {
+        error_report("failed to get system registers");
+        return -1;
+    }
+
+    for (size_t i = 0; i < n_regs; i++) {
+        *(uint64_t *)((void *)env + mshv_sysreg_match[i].offset) =
+            assocs[i].value.reg64;
+    }
 
     return 0;
 }
@@ -127,9 +335,21 @@ static int load_regs(CPUState *cpu)
 {
     int ret;
 
-    ret = get_standard_regs(cpu);
+    ret = load_core_regs(cpu);
     if (ret < 0) {
-        error_report("Failed to load standard registers");
+        error_report("Failed to load core registers");
+        return -1;
+    }
+
+    ret = load_fp_regs(cpu);
+    if (ret < 0) {
+        error_report("Failed to load FP/SIMD registers");
+        return -1;
+    }
+
+    ret = load_sys_regs(cpu);
+    if (ret < 0) {
+        error_report("Failed to load system registers");
         return -1;
     }
 
@@ -140,9 +360,21 @@ static int store_regs(const CPUState *cpu)
 {
     int ret;
 
-    ret = set_standard_regs(cpu);
+    ret = store_core_regs(cpu);
     if (ret < 0) {
-        error_report("Failed to store standard registers");
+        error_report("Failed to store core registers");
+        return -1;
+    }
+
+    ret = store_fp_regs(cpu);
+    if (ret < 0) {
+        error_report("Failed to store FP/SIMD registers");
+        return -1;
+    }
+
+    ret = store_sys_regs(cpu);
+    if (ret < 0) {
+        error_report("Failed to store system registers");
         return -1;
     }
 
