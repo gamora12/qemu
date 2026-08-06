@@ -14,12 +14,16 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/memalign.h"
+#include "hw/core/cpu.h"
 #include "hw/intc/arm_gicv3_common.h"
 #include "migration/blocker.h"
+#include "migration/vmstate.h"
 #include "target/arm/cpregs.h"
 #include "hw/hyperv/hvgdk_mini.h"
 #include "system/mshv.h"
 #include "system/mshv_int.h"
+#include "linux/mshv.h"
 
 struct MSHVARMGICv3Class {
     ARMGICv3CommonClass parent_class;
@@ -27,10 +31,32 @@ struct MSHVARMGICv3Class {
     ResettablePhases parent_phases;
 };
 
-OBJECT_DECLARE_TYPE(GICv3State, MSHVARMGICv3Class, MSHV_GICV3)
+typedef struct MSHVARMGICv3Class MSHVARMGICv3Class;
+
+/*
+ * MSHV models the GICv3 entirely inside the hypervisor and only exposes it
+ * as an opaque, per-VP "local interrupt controller" state blob (the same
+ * MSHV_VP_STATE_LAPIC type used for the x86 local APIC). The distributor,
+ * redistributor and CPU interface state are all folded into this blob; there
+ * is no per-register window like KVM provides. We therefore save/restore one
+ * page-sized opaque blob per VP and migrate them verbatim.
+ */
+typedef struct MshvGICv3State {
+    GICv3State parent_obj;
+    uint32_t vp_state_size;
+    uint8_t *vp_state;
+} MshvGICv3State;
+
+DECLARE_OBJ_CHECKERS(MshvGICv3State, MSHVARMGICv3Class,
+                     MSHV_GICV3, TYPE_MSHV_GICV3)
 
 static void mshv_gicv3_get(GICv3State *s)
 {
+    /*
+     * The decoded distributor/redistributor/CPU-interface state is not
+     * accessible under MSHV; the authoritative state travels as an opaque
+     * per-VP blob migrated by the vmstate_gicv3_mshv subsection.
+     */
 }
 
 static void mshv_gicv3_put(GICv3State *s)
@@ -83,7 +109,7 @@ static void mshv_gicv3_set_irq(void *opaque, int irq, int level)
 static void mshv_gicv3_realize(DeviceState *dev, Error **errp)
 {
     ERRP_GUARD();
-    GICv3State *s = MSHV_GICV3(dev);
+    GICv3State *s = ARM_GICV3_COMMON(dev);
     MSHVARMGICv3Class *mgc = MSHV_GICV3_GET_CLASS(s);
     int i, ret;
 
@@ -141,13 +167,112 @@ static void mshv_gicv3_realize(DeviceState *dev, Error **errp)
                "Nested virtualisation not currently supported by MSHV");
         return;
     }
-
-    error_setg(&s->migration_blocker,
-        "Live migration disabled because GIC state save/restore not supported on MSHV");
-    if (migrate_add_blocker(&s->migration_blocker, errp) < 0) {
-        error_report_err(*errp);
-    }
 }
+
+/*
+ * Save/restore the opaque per-VP GICv3 state. MSHV exposes the whole GIC
+ * (distributor + redistributor + CPU interface) as a page-sized opaque blob
+ * per VP, retrieved/applied via MSHV_GET_VP_STATE/MSHV_SET_VP_STATE with the
+ * MSHV_VP_STATE_LAPIC state type. The hypervisor requires the transfer buffer
+ * to be page aligned, so we bounce each VP's blob through an aligned page.
+ */
+#define MSHV_GIC_VP_STATE_SIZE HV_HYP_PAGE_SIZE
+
+static int mshv_gic_opaque_state_save(void *opaque)
+{
+    MshvGICv3State *mgs = opaque;
+    GICv3State *s = ARM_GICV3_COMMON(opaque);
+    size_t page = MSHV_GIC_VP_STATE_SIZE;
+    void *bounce;
+    int i;
+
+    mgs->vp_state_size = s->num_cpu * page;
+    mgs->vp_state = g_malloc0(mgs->vp_state_size);
+    bounce = qemu_memalign(page, page);
+
+    for (i = 0; i < s->num_cpu; i++) {
+        CPUState *cpu = s->cpu[i].cpu;
+
+        memset(bounce, 0, page);
+        if (mshv_get_vp_state(cpu, MSHV_VP_STATE_LAPIC, bounce, page) < 0) {
+            error_report("mshv: vgic: failed to get GIC state for CPU %d", i);
+            qemu_vfree(bounce);
+            g_free(mgs->vp_state);
+            mgs->vp_state = NULL;
+            mgs->vp_state_size = 0;
+            return 1;
+        }
+        memcpy(mgs->vp_state + (size_t)i * page, bounce, page);
+    }
+
+    qemu_vfree(bounce);
+    return 0;
+}
+
+static void mshv_gic_opaque_state_free(void *opaque)
+{
+    MshvGICv3State *mgs = opaque;
+
+    g_free(mgs->vp_state);
+    mgs->vp_state = NULL;
+    mgs->vp_state_size = 0;
+}
+
+static int mshv_gic_opaque_state_restore(void *opaque, int version_id)
+{
+    MshvGICv3State *mgs = opaque;
+    GICv3State *s = ARM_GICV3_COMMON(opaque);
+    size_t page = MSHV_GIC_VP_STATE_SIZE;
+    void *bounce;
+    int i;
+
+    if (!mgs->vp_state_size) {
+        return 0;
+    }
+
+    if (mgs->vp_state_size != (uint32_t)(s->num_cpu * page)) {
+        error_report("mshv: vgic: unexpected GIC state size %u (want %zu)",
+                     mgs->vp_state_size, s->num_cpu * page);
+        return 1;
+    }
+
+    bounce = qemu_memalign(page, page);
+
+    for (i = 0; i < s->num_cpu; i++) {
+        CPUState *cpu = s->cpu[i].cpu;
+
+        memcpy(bounce, mgs->vp_state + (size_t)i * page, page);
+        if (mshv_set_vp_state(cpu, MSHV_VP_STATE_LAPIC, bounce, page) < 0) {
+            error_report("mshv: vgic: failed to set GIC state for CPU %d", i);
+            qemu_vfree(bounce);
+            return 1;
+        }
+    }
+
+    qemu_vfree(bounce);
+    return 0;
+}
+
+static bool gicv3_is_mshv(void *opaque)
+{
+    return mshv_enabled();
+}
+
+const VMStateDescription vmstate_gicv3_mshv = {
+    .name = "arm_gicv3/mshv_gic_state",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = gicv3_is_mshv,
+    .pre_save = mshv_gic_opaque_state_save,
+    .post_save = mshv_gic_opaque_state_free,
+    .post_load = mshv_gic_opaque_state_restore,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(vp_state_size, MshvGICv3State),
+        VMSTATE_VBUFFER_ALLOC_UINT32(vp_state, MshvGICv3State, 0, 0,
+                                     vp_state_size),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static void mshv_gicv3_class_init(ObjectClass *klass, const void *data)
 {
@@ -168,7 +293,7 @@ static void mshv_gicv3_class_init(ObjectClass *klass, const void *data)
 static const TypeInfo mshv_arm_gicv3_info = {
     .name = TYPE_MSHV_GICV3,
     .parent = TYPE_ARM_GICV3_COMMON,
-    .instance_size = sizeof(GICv3State),
+    .instance_size = sizeof(MshvGICv3State),
     .class_init = mshv_gicv3_class_init,
     .class_size = sizeof(MSHVARMGICv3Class),
 };

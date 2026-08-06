@@ -141,6 +141,48 @@ void mshv_remove_vcpu(int vm_fd, int cpu_fd)
     close(cpu_fd);
 }
 
+int mshv_get_vp_state(const CPUState *cpu, uint8_t type, void *buf,
+                      size_t buf_sz)
+{
+    int cpu_fd = mshv_vcpufd(cpu);
+    struct mshv_get_set_vp_state arg = {0};
+    int ret;
+
+    arg.type = type;
+    arg.buf_sz = buf_sz;
+    arg.buf_ptr = (uint64_t)buf;
+
+    ret = ioctl(cpu_fd, MSHV_GET_VP_STATE, &arg);
+    if (ret < 0) {
+        error_report("failed to get vp state (type %u): %s", type,
+                     strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+int mshv_set_vp_state(const CPUState *cpu, uint8_t type, const void *buf,
+                      size_t buf_sz)
+{
+    int cpu_fd = mshv_vcpufd(cpu);
+    struct mshv_get_set_vp_state arg = {0};
+    int ret;
+
+    arg.type = type;
+    arg.buf_sz = buf_sz;
+    arg.buf_ptr = (uint64_t)buf;
+
+    ret = ioctl(cpu_fd, MSHV_SET_VP_STATE, &arg);
+    if (ret < 0) {
+        error_report("failed to set vp state (type %u): %s", type,
+                     strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
 void mshv_setup_hvcall_args(AccelCPUState *state)
 {
     void *mem = qemu_memalign(HV_HYP_PAGE_SIZE, 2 * HV_HYP_PAGE_SIZE);

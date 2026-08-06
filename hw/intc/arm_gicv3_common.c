@@ -308,6 +308,7 @@ static const VMStateDescription vmstate_gicv3 = {
         &vmstate_gicv3_gicd_no_migration_shift_bug,
         &vmstate_gicv3_gicd_nmi,
         &vmstate_gicv3_hvf,
+        &vmstate_gicv3_mshv,
         NULL
     }
 };

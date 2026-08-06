@@ -343,4 +343,7 @@ const char *gicv3_class_name(void);
 /* HVF vGIC-specific state: stubbed out on a build with HVF disabled */
 extern const VMStateDescription vmstate_gicv3_hvf;
 
+/* MSHV vGIC-specific state: stubbed out on a build with MSHV disabled */
+extern const VMStateDescription vmstate_gicv3_mshv;
+
 #endif
