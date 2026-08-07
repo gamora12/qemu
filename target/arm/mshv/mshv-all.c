@@ -331,6 +331,67 @@ static int load_sys_regs(CPUState *cpu)
     return 0;
 }
 
+/*
+ * MSHV has no explicit power-state register. Hyper-V models the PSCI power
+ * state of a VP by holding it in "explicit suspend": a powered-off VP (PSCI
+ * CPU_OFF, or a secondary core prior to CPU_ON) has EXPLICIT_SUSPEND.suspended
+ * set, while a running VP has it cleared. This mirrors KVM's mp_state
+ * (KVM_MP_STATE_STOPPED vs KVM_MP_STATE_RUNNABLE) sync.
+ */
+static int store_mp_state(const CPUState *cpu)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    int ret;
+
+    if (arm_cpu->power_state == PSCI_OFF) {
+        struct hv_register_assoc assoc = {
+            .name = HV_REGISTER_EXPLICIT_SUSPEND,
+        };
+        assoc.value.explicit_suspend.suspended = 1;
+
+        ret = mshv_set_generic_regs(cpu, &assoc, 1);
+    } else {
+        /*
+         * Resume the VP. The intercept suspend must be cleared before the
+         * explicit suspend, otherwise the VP would remain suspended.
+         */
+        struct hv_register_assoc assocs[2] = {};
+        assocs[0].name = HV_REGISTER_INTERCEPT_SUSPEND;
+        assocs[0].value.intercept_suspend.suspended = 0;
+        assocs[1].name = HV_REGISTER_EXPLICIT_SUSPEND;
+        assocs[1].value.explicit_suspend.suspended = 0;
+
+        ret = mshv_set_generic_regs(cpu, assocs, 2);
+    }
+
+    if (ret < 0) {
+        error_report("failed to set mp state");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int load_mp_state(CPUState *cpu)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    struct hv_register_assoc assoc = {
+        .name = HV_REGISTER_EXPLICIT_SUSPEND,
+    };
+    int ret;
+
+    ret = mshv_get_generic_regs(cpu, &assoc, 1);
+    if (ret < 0) {
+        error_report("failed to get mp state");
+        return -1;
+    }
+
+    arm_set_cpu_power_state(arm_cpu,
+        assoc.value.explicit_suspend.suspended ? PSCI_OFF : PSCI_ON);
+
+    return 0;
+}
+
 static int load_regs(CPUState *cpu)
 {
     int ret;
@@ -350,6 +411,12 @@ static int load_regs(CPUState *cpu)
     ret = load_sys_regs(cpu);
     if (ret < 0) {
         error_report("Failed to load system registers");
+        return -1;
+    }
+
+    ret = load_mp_state(cpu);
+    if (ret < 0) {
+        error_report("Failed to load mp state");
         return -1;
     }
 
@@ -375,6 +442,12 @@ static int store_regs(const CPUState *cpu)
     ret = store_sys_regs(cpu);
     if (ret < 0) {
         error_report("Failed to store system registers");
+        return -1;
+    }
+
+    ret = store_mp_state(cpu);
+    if (ret < 0) {
+        error_report("Failed to store mp state");
         return -1;
     }
 
