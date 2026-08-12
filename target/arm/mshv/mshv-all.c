@@ -533,10 +533,30 @@ static int handle_unmapped_mem(int vm_fd, CPUState *cpu,
 
     syndrome.raw = info.syndrome;
 
-    ret = load_regs(cpu);
-    if (ret < 0) {
-        error_report("Failed to load registers");
-        return -1;
+    /*
+     * MMIO emulation must touch as little vCPU state as possible. Only the
+     * transfer register (for the value moved to/from the device) and the PC
+     * (to step over the faulting instruction) are needed.
+     *
+     * Deliberately do NOT round-trip the full core register set here: writing
+     * SP, PSTATE and SPSR back to MSHV on every MMIO exit can perturb state
+     * that the guest depends on across the trap. In particular, Pointer
+     * Authentication uses SP as the signing modifier, so any transient SP or
+     * PSTATE inconsistency corrupts PAC and faults (FPAC) on the next
+     * autiasp/autibsp. KVM likewise only writes back the transfer register and
+     * PC for an MMIO exit.
+     */
+    IssDataAbort iss = { .raw = syndrome.iss };
+    uint32_t srt = iss.srt;
+
+    /* For a store, fetch just the source transfer register from MSHV. */
+    if (iss.wnr && srt < 31) {
+        struct hv_register_assoc in = { .name = mshv_reg_match[srt].hv_reg };
+        if (mshv_get_generic_regs(cpu, &in, 1) < 0) {
+            error_report("Failed to load MMIO transfer register");
+            return -1;
+        }
+        env->xregs[srt] = in.value.reg64;
     }
 
     static const struct arm_emul_ops mshv_arm_emul_ops = {
@@ -547,18 +567,64 @@ static int handle_unmapped_mem(int vm_fd, CPUState *cpu,
     ret = arm_emulate_mmio(cpu, syndrome, info.guest_physical_address,
                            &mshv_arm_emul_ops);
     if (ret < 0) {
-        error_report("Failed to emulate with syndrome");
+        error_report("Failed to emulate MMIO access at gpa 0x%" PRIx64
+                     " (pc 0x%" PRIx64 ", syndrome 0x%" PRIx64 ")",
+                     info.guest_physical_address, info.header.pc,
+                     info.syndrome);
         return -1;
     }
 
-    /* Advance PC past the faulting instruction */
-    env->pc += (syndrome.il == 1) ? 4 : 2;
+    /*
+     * Write back only the PC (advanced past the faulting instruction) and,
+     * for a load, the destination transfer register. Use the PC reported in
+     * the intercept message rather than a previously-synced env->pc.
+     */
+    struct hv_register_assoc out[2];
+    size_t nout = 0;
 
-    ret = store_regs(cpu);
-    if (ret < 0) {
-        error_report("Failed to store registers");
+    uint64_t advanced_pc = info.header.pc + (syndrome.il == 1 ? 4 : 2);
+
+    out[nout].name = HV_ARM64_REGISTER_PC;
+    out[nout].value.reg64 = advanced_pc;
+    nout++;
+
+    if (!iss.wnr && srt < 31) {
+        out[nout].name = mshv_reg_match[srt].hv_reg;
+        out[nout].value.reg64 = env->xregs[srt];
+        nout++;
+    }
+
+    /*
+     * Keep env->pc consistent with the PC advanced in MSHV so env never holds
+     * a stale (pre-advance) PC after this exit. The vcpu_dirty clear below is
+     * what actually prevents a harmful full writeback, but keeping env correct
+     * avoids surprises for any later legitimate synchronize.
+     */
+    env->pc = advanced_pc;
+
+    if (mshv_set_generic_regs(cpu, out, nout) < 0) {
+        error_report("Failed to store MMIO result registers");
         return -1;
     }
+
+    /*
+     * MMIO emulation can re-enter QEMU code that calls cpu_synchronize_state()
+     * -- e.g. virtio_reset() -> cpu_internal_is_big_endian() on a virtio
+     * Status write. On MSHV that does a full load_regs() and marks the vCPU
+     * dirty, even though the synchronize is read-only (QEMU inspects env but
+     * never changes it). If the vCPU is left dirty, the run loop performs a
+     * full store_regs() that blindly overwrites MSHV's live VP register state.
+     * That clobbers state MSHV updates asynchronously -- in particular the
+     * virtual-timer interrupt entry context and the SCTLR_EL1 pointer-auth
+     * enable bits -- corrupting Pointer Authentication so a signed pointer is
+     * branched to without being authenticated (crash in the timer handler).
+     *
+     * We have already reconciled the only state MMIO can change (the transfer
+     * register and PC) via the minimal writeback above, and env now matches
+     * MSHV. Clear the dirty flag so the run loop does not push the full,
+     * redundant register set back and race MSHV's own updates.
+     */
+    cpu->vcpu_dirty = false;
 
     *exit_reason = MshvVmExitIgnore;
 
