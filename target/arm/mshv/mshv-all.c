@@ -308,6 +308,17 @@ static int store_sys_regs(const CPUState *cpu)
 
     ret = mshv_set_generic_regs(cpu, assocs, n_regs);
     if (ret < 0) {
+        /*
+         * The batched hvcall does not tell us which register was rejected.
+         * Retry one register at a time so we can log the offending name(s).
+         */
+        for (size_t i = 0; i < n_regs; i++) {
+            if (mshv_set_generic_regs(cpu, &assocs[i], 1) < 0) {
+                error_report("failed to set system register 0x%08x "
+                             "(value 0x%016" PRIx64 ")",
+                             assocs[i].name, assocs[i].value.reg64);
+            }
+        }
         error_report("failed to set system registers");
         return -1;
     }
