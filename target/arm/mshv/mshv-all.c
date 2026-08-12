@@ -95,6 +95,10 @@ static const MshvRegMatch mshv_reg_match[] = {
  *
  * AFSR0_EL1, AFSR1_EL1 and AMAIR_EL1 are intentionally omitted: QEMU models
  * them as RAZ/WI and keeps no backing state for them.
+ *
+ * CNTVOFF_EL2 is intentionally omitted: it is a hypervisor-owned EL2 register
+ * that MSHV manages internally and rejects on HVCALL_SET_VP_REGISTERS (EINVAL).
+ * KVM likewise does not sync it as a per-vCPU register.
  */
 static const MshvRegMatch mshv_sysreg_match[] = {
     { HV_ARM64_REGISTER_SCTLR_EL1,      offsetof(CPUARMState, cp15.sctlr_el[1]) },
@@ -114,11 +118,17 @@ static const MshvRegMatch mshv_sysreg_match[] = {
     { HV_ARM64_REGISTER_CSSELR_EL1,     offsetof(CPUARMState, cp15.csselr_el[1]) },
     { HV_ARM64_REGISTER_MDSCR_EL1,      offsetof(CPUARMState, cp15.mdscr_el1) },
     { HV_ARM64_REGISTER_CNTKCTL_EL1,    offsetof(CPUARMState, cp15.c14_cntkctl) },
-    { HV_ARM64_REGISTER_CNTVOFF_EL2,    offsetof(CPUARMState, cp15.cntvoff_el2) },
-    { HV_ARM64_REGISTER_CNTV_CTL_EL0,
-      offsetof(CPUARMState, cp15.c14_timer[GTIMER_VIRT].ctl) },
-    { HV_ARM64_REGISTER_CNTV_CVAL_EL0,
-      offsetof(CPUARMState, cp15.c14_timer[GTIMER_VIRT].cval) },
+    /*
+     * The EL1 virtual timer (CNTV_CTL_EL0 / CNTV_CVAL_EL0) is owned and driven
+     * by MSHV internally: the hypervisor programs the timer and injects the
+     * virtual timer PPI (INTID 27) itself. QEMU never observes the guest's
+     * direct writes to these registers (they are not trapped), so env holds a
+     * stale copy. The post-init and post-reset paths call store_regs() with no
+     * preceding load_regs(), which would push those stale/reset values back
+     * into MSHV and reprogram the live timer -- causing a storm of spurious,
+     * mis-contexted INTID 27 interrupts in the guest. Like CNTVOFF_EL2, these
+     * must not be part of the routine per-vCPU register sync.
+     */
 };
 
 /* SIMD/FP registers Q0..Q31 map to the low 128 bits of vfp.zregs[i]. */
