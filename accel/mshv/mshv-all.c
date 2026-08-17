@@ -517,13 +517,19 @@ static void register_mshv_memory_listener(MshvState *s, MshvMemoryListener *mml,
     }
 }
 
-int mshv_hvcall(int fd, const mshv_root_hvcall *args)
+int mshv_hvcall(int fd, mshv_root_hvcall *args)
 {
     int ret = 0;
 
     ret = ioctl(fd, MSHV_ROOT_HVCALL, args);
     if (ret < 0) {
-        error_report("Failed to perform hvcall: %s", strerror(errno));
+        /*
+         * The driver copies the hypervisor status back out even on failure.
+         * Report it: the errno alone collapses distinct hypervisor results
+         * (e.g. invalid parameter vs access denied) onto the same value.
+         */
+        error_report("Failed to perform hvcall 0x%04x: %s (hv status 0x%04x)",
+                     args->code, strerror(errno), args->status);
         return -1;
     }
     return ret;
@@ -645,7 +651,19 @@ static int mshv_cpu_exec(CPUState *cpu)
 
         ret = mshv_run_vcpu(mshv_state->vm, cpu, &mshv_msg, &exit_reason);
         if (ret < 0) {
-            error_report("Failed to run on vcpu %d", cpu->cpu_index);
+            /*
+             * The VP run was interrupted before it could deliver a message,
+             * typically by the SIG_IPI kick QEMU uses to force the vCPU out
+             * so pending work can run (e.g. the stop request issued when a
+             * live migration completes). This is not an error: leave the
+             * inner loop so the vCPU thread processes the pending events.
+             */
+            if (ret == -EINTR || ret == -EAGAIN) {
+                ret = EXCP_INTERRUPT;
+                break;
+            }
+            error_report("Failed to run on vcpu %d: %s", cpu->cpu_index,
+                         strerror(-ret));
             abort();
         }
 

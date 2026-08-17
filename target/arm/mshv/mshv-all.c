@@ -131,6 +131,31 @@ static const MshvRegMatch mshv_sysreg_match[] = {
      */
 };
 
+/*
+ * Pointer authentication keys.
+ *
+ * The guest writes these via MSR and the accesses are not trapped, so env
+ * never observes them: the live values exist only in the VP. They must still
+ * be transferred on migration, because the guest's in-memory signed pointers
+ * were signed with the source VP's keys -- if the destination VP keeps its
+ * own keys, the first AUTIASP fails and the guest takes an FPAC exception.
+ *
+ * These are kept out of mshv_sysreg_match[] because they only exist when the
+ * CPU implements FEAT_PAuth; they are synced separately after that check.
+ */
+static const MshvRegMatch mshv_pauth_reg_match[] = {
+    { HV_ARM64_REGISTER_API_A_KEY_LO_EL1, offsetof(CPUARMState, keys.apia.lo) },
+    { HV_ARM64_REGISTER_API_A_KEY_HI_EL1, offsetof(CPUARMState, keys.apia.hi) },
+    { HV_ARM64_REGISTER_API_B_KEY_LO_EL1, offsetof(CPUARMState, keys.apib.lo) },
+    { HV_ARM64_REGISTER_API_B_KEY_HI_EL1, offsetof(CPUARMState, keys.apib.hi) },
+    { HV_ARM64_REGISTER_APD_A_KEY_LO_EL1, offsetof(CPUARMState, keys.apda.lo) },
+    { HV_ARM64_REGISTER_APD_A_KEY_HI_EL1, offsetof(CPUARMState, keys.apda.hi) },
+    { HV_ARM64_REGISTER_APD_B_KEY_LO_EL1, offsetof(CPUARMState, keys.apdb.lo) },
+    { HV_ARM64_REGISTER_APD_B_KEY_HI_EL1, offsetof(CPUARMState, keys.apdb.hi) },
+    { HV_ARM64_REGISTER_APG_A_KEY_LO_EL1, offsetof(CPUARMState, keys.apga.lo) },
+    { HV_ARM64_REGISTER_APG_A_KEY_HI_EL1, offsetof(CPUARMState, keys.apga.hi) },
+};
+
 /* SIMD/FP registers Q0..Q31 map to the low 128 bits of vfp.zregs[i]. */
 static const uint32_t mshv_fpreg_names[32] = {
     HV_ARM64_REGISTER_Q0,  HV_ARM64_REGISTER_Q1,  HV_ARM64_REGISTER_Q2,
@@ -292,6 +317,59 @@ static int load_fp_regs(CPUState *cpu)
     return 0;
 }
 
+static int store_pauth_regs(const CPUState *cpu)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    struct hv_register_assoc assocs[ARRAY_SIZE(mshv_pauth_reg_match)] = {};
+    size_t n_regs = ARRAY_SIZE(mshv_pauth_reg_match);
+
+    if (!cpu_isar_feature(aa64_pauth, arm_cpu)) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < n_regs; i++) {
+        assocs[i].name = mshv_pauth_reg_match[i].hv_reg;
+        assocs[i].value.reg64 =
+            *(uint64_t *)((void *)env + mshv_pauth_reg_match[i].offset);
+    }
+
+    if (mshv_set_generic_regs(cpu, assocs, n_regs) < 0) {
+        error_report("failed to set pointer authentication keys");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int load_pauth_regs(CPUState *cpu)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    struct hv_register_assoc assocs[ARRAY_SIZE(mshv_pauth_reg_match)] = {};
+    size_t n_regs = ARRAY_SIZE(mshv_pauth_reg_match);
+
+    if (!cpu_isar_feature(aa64_pauth, arm_cpu)) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < n_regs; i++) {
+        assocs[i].name = mshv_pauth_reg_match[i].hv_reg;
+    }
+
+    if (mshv_get_generic_regs(cpu, assocs, n_regs) < 0) {
+        error_report("failed to get pointer authentication keys");
+        return -1;
+    }
+
+    for (size_t i = 0; i < n_regs; i++) {
+        *(uint64_t *)((void *)env + mshv_pauth_reg_match[i].offset) =
+            assocs[i].value.reg64;
+    }
+
+    return 0;
+}
+
 static int store_sys_regs(const CPUState *cpu)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
@@ -435,6 +513,12 @@ static int load_regs(CPUState *cpu)
         return -1;
     }
 
+    ret = load_pauth_regs(cpu);
+    if (ret < 0) {
+        error_report("Failed to load pointer authentication keys");
+        return -1;
+    }
+
     ret = load_mp_state(cpu);
     if (ret < 0) {
         error_report("Failed to load mp state");
@@ -463,6 +547,12 @@ static int store_regs(const CPUState *cpu)
     ret = store_sys_regs(cpu);
     if (ret < 0) {
         error_report("Failed to store system registers");
+        return -1;
+    }
+
+    ret = store_pauth_regs(cpu);
+    if (ret < 0) {
+        error_report("Failed to store pointer authentication keys");
         return -1;
     }
 
@@ -639,10 +729,17 @@ int mshv_run_vcpu(int vm_fd, CPUState *cpu, hv_message *msg, MshvVmExit *exit)
     ret = ioctl(cpu_fd, MSHV_RUN_VP, msg);
     if (ret < 0) {
         *exit = MshvVmExitShutdown;
-        return ret;
+        return -errno;
     }
 
     switch (msg->header.message_type) {
+    case HVMSG_NONE:
+        /*
+         * No intercept message. This happens when the VP run is interrupted,
+         * e.g. by a SIG_IPI kick for pending timer/I/O work. Re-enter the VP.
+         */
+        *exit = MshvVmExitIgnore;
+        break;
     case HVMSG_UNRECOVERABLE_EXCEPTION:
         *exit = MshvVmExitShutdown;
         break;

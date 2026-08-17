@@ -34,21 +34,36 @@ struct MSHVARMGICv3Class {
 typedef struct MSHVARMGICv3Class MSHVARMGICv3Class;
 
 /*
- * MSHV models the GICv3 entirely inside the hypervisor and only exposes it
- * as an opaque, per-VP "local interrupt controller" state blob (the same
- * MSHV_VP_STATE_LAPIC type used for the x86 local APIC). The distributor,
- * redistributor and CPU interface state are all folded into this blob; there
- * is no per-register window like KVM provides. We therefore save/restore one
- * page-sized opaque blob per VP and migrate them verbatim.
+ * MSHV models the GICv3 entirely inside the hypervisor and only exposes it as
+ * an opaque, per-VP local interrupt controller state blob. MSHV_VP_STATE_LAPIC
+ * is the architecture-neutral name for that state (see the "either arch"
+ * comment on the enum in linux/mshv.h); on arm64 it carries the GIC state, on
+ * x86 the local APIC. The distributor, redistributor and CPU interface state
+ * are all folded into this blob; there is no per-register window like KVM
+ * provides.
+ *
+ * The GIC state must not be migrated through GET/SET_VP_REGISTERS instead:
+ * the ICC and ICH system registers describe only the CPU interface and give no
+ * stable representation of the distributor/redistributor state or of the
+ * hypervisor-internal interrupt delivery queues.
+ *
+ * The blob is only meaningful once every VP is suspended, which is the case
+ * for a vmstate pre_save: migration completes the stop-the-guest handshake
+ * before the non-iterative device state is written. Likewise post_load runs
+ * before any destination VP is started.
  */
 typedef struct MshvGICv3State {
     GICv3State parent_obj;
     uint32_t vp_state_size;
     uint8_t *vp_state;
+    Error *migration_blocker;
 } MshvGICv3State;
 
 DECLARE_OBJ_CHECKERS(MshvGICv3State, MSHVARMGICv3Class,
                      MSHV_GICV3, TYPE_MSHV_GICV3)
+
+/* The hypervisor requires the per-VP state buffer to be page aligned. */
+#define MSHV_GIC_VP_STATE_SIZE HV_HYP_PAGE_SIZE
 
 static void mshv_gicv3_get(GICv3State *s)
 {
@@ -111,6 +126,8 @@ static void mshv_gicv3_realize(DeviceState *dev, Error **errp)
     ERRP_GUARD();
     GICv3State *s = ARM_GICV3_COMMON(dev);
     MSHVARMGICv3Class *mgc = MSHV_GICV3_GET_CLASS(s);
+    MshvGICv3State *mgs = MSHV_GICV3(dev);
+    void *probe;
     int i, ret;
 
     mgc->parent_realize(dev, errp);
@@ -167,6 +184,32 @@ static void mshv_gicv3_realize(DeviceState *dev, Error **errp)
                "Nested virtualisation not currently supported by MSHV");
         return;
     }
+
+    /*
+     * Probe the per-VP state interface up front. The GIC state is only
+     * reachable through MSHV_[GET,SET]_VP_STATE, and some hosts do not
+     * implement it (the ioctls are compiled out of the mshv driver behind
+     * HV_SUPPORTS_VP_STATE, in which case they fail with ENOTTY). Without it
+     * the controller state cannot be transferred, so block migration here
+     * rather than letting it fail -- or, worse, appear to succeed -- once the
+     * guest has already been stopped.
+     */
+    probe = qemu_memalign(MSHV_GIC_VP_STATE_SIZE, MSHV_GIC_VP_STATE_SIZE);
+    memset(probe, 0, MSHV_GIC_VP_STATE_SIZE);
+    ret = mshv_get_vp_state(qemu_get_cpu(0), MSHV_VP_STATE_LAPIC, probe,
+                            MSHV_GIC_VP_STATE_SIZE);
+    qemu_vfree(probe);
+
+    if (ret < 0) {
+        error_setg(&mgs->migration_blocker,
+                   "This host cannot save the MSHV GICv3 state: the "
+                   "MSHV_GET_VP_STATE ioctl is unavailable, so the interrupt "
+                   "controller state cannot be migrated");
+        if (migrate_add_blocker(&mgs->migration_blocker, errp) < 0) {
+            return;
+        }
+        warn_report("mshv: vgic: per-VP state unavailable, migration disabled");
+    }
 }
 
 /*
@@ -176,7 +219,6 @@ static void mshv_gicv3_realize(DeviceState *dev, Error **errp)
  * MSHV_VP_STATE_LAPIC state type. The hypervisor requires the transfer buffer
  * to be page aligned, so we bounce each VP's blob through an aligned page.
  */
-#define MSHV_GIC_VP_STATE_SIZE HV_HYP_PAGE_SIZE
 
 static int mshv_gic_opaque_state_save(void *opaque)
 {
@@ -200,7 +242,7 @@ static int mshv_gic_opaque_state_save(void *opaque)
             g_free(mgs->vp_state);
             mgs->vp_state = NULL;
             mgs->vp_state_size = 0;
-            return 1;
+            return -1;
         }
         memcpy(mgs->vp_state + (size_t)i * page, bounce, page);
     }
@@ -233,7 +275,7 @@ static int mshv_gic_opaque_state_restore(void *opaque, int version_id)
     if (mgs->vp_state_size != (uint32_t)(s->num_cpu * page)) {
         error_report("mshv: vgic: unexpected GIC state size %u (want %zu)",
                      mgs->vp_state_size, s->num_cpu * page);
-        return 1;
+        return -1;
     }
 
     bounce = qemu_memalign(page, page);
@@ -245,7 +287,7 @@ static int mshv_gic_opaque_state_restore(void *opaque, int version_id)
         if (mshv_set_vp_state(cpu, MSHV_VP_STATE_LAPIC, bounce, page) < 0) {
             error_report("mshv: vgic: failed to set GIC state for CPU %d", i);
             qemu_vfree(bounce);
-            return 1;
+            return -1;
         }
     }
 

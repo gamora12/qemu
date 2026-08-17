@@ -114,7 +114,7 @@ int mshv_arch_post_init_vm(int vm_fd);
 void mshv_setup_hvcall_args(AccelCPUState *state);
 
 typedef struct mshv_root_hvcall mshv_root_hvcall;
-int mshv_hvcall(int fd, const mshv_root_hvcall *args);
+int mshv_hvcall(int fd, mshv_root_hvcall *args);
 
 /* memory */
 typedef struct MshvMemoryRegion {
