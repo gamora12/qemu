@@ -884,7 +884,13 @@ int mshv_arch_accel_init(AccelState *as, MachineState *ms, int mshv_fd)
 void mshv_arch_amend_proc_features(
     union hv_partition_synthetic_processor_features *features)
 {
-
+    /*
+     * TLB-flush hypercalls are an x86 enlightenment; on ARM the guest
+     * broadcasts TLBI instructions instead. Newer hypervisors reject the
+     * bit with HV_STATUS_PROPERTY_VALUE_OUT_OF_RANGE, which fails partition
+     * setup, so never request it here.
+     */
+    features->tb_flush_hypercalls = 0;
 }
 
 void mshv_arch_disable_partition_proc_features(

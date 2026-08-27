@@ -65,6 +65,22 @@ DECLARE_OBJ_CHECKERS(MshvGICv3State, MSHVARMGICv3Class,
 /* The hypervisor requires the per-VP state buffer to be page aligned. */
 #define MSHV_GIC_VP_STATE_SIZE HV_HYP_PAGE_SIZE
 
+typedef struct MshvGICStateHeader {
+    uint8_t version;
+    uint8_t gic_version;
+} MshvGICStateHeader;
+
+#define MSHV_GIC_STATE_MIN_VERSION 1
+#define MSHV_GIC_VERSION_3         3
+
+static bool mshv_gic_state_is_valid(const void *state)
+{
+    const MshvGICStateHeader *header = state;
+
+    return header->version >= MSHV_GIC_STATE_MIN_VERSION &&
+           header->gic_version == MSHV_GIC_VERSION_3;
+}
+
 static void mshv_gicv3_get(GICv3State *s)
 {
     /*
@@ -198,17 +214,29 @@ static void mshv_gicv3_realize(DeviceState *dev, Error **errp)
     memset(probe, 0, MSHV_GIC_VP_STATE_SIZE);
     ret = mshv_get_vp_state(qemu_get_cpu(0), MSHV_VP_STATE_LAPIC, probe,
                             MSHV_GIC_VP_STATE_SIZE);
-    qemu_vfree(probe);
 
     if (ret < 0) {
         error_setg(&mgs->migration_blocker,
                    "This host cannot save the MSHV GICv3 state: the "
                    "MSHV_GET_VP_STATE ioctl is unavailable, so the interrupt "
                    "controller state cannot be migrated");
+    } else if (!mshv_gic_state_is_valid(probe)) {
+        const MshvGICStateHeader *header = probe;
+
+        error_setg(&mgs->migration_blocker,
+                   "This host returned an invalid MSHV GICv3 state: "
+                   "(version %u, gic_version %u)",
+                   header->version, header->gic_version);
+    }
+
+    qemu_vfree(probe);
+
+    if (mgs->migration_blocker) {
         if (migrate_add_blocker(&mgs->migration_blocker, errp) < 0) {
             return;
         }
-        warn_report("mshv: vgic: per-VP state unavailable, migration disabled");
+        warn_report("mshv: vgic: invalid or unavailable per-VP state; "
+                    "migration disabled");
     }
 }
 
@@ -244,6 +272,20 @@ static int mshv_gic_opaque_state_save(void *opaque)
             mgs->vp_state_size = 0;
             return -1;
         }
+
+        if (!mshv_gic_state_is_valid(bounce)) {
+            const MshvGICStateHeader *header = bounce;
+
+            error_report("mshv: vgic: invalid GIC state for CPU %d: "
+                         "(version %u, gic_version %u)",
+                         i, header->version, header->gic_version);
+            qemu_vfree(bounce);
+            g_free(mgs->vp_state);
+            mgs->vp_state = NULL;
+            mgs->vp_state_size = 0;
+            return -1;
+        }
+
         memcpy(mgs->vp_state + (size_t)i * page, bounce, page);
     }
 
