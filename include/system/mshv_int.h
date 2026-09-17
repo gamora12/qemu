@@ -44,6 +44,54 @@ typedef struct MshvHvCallArgs {
 struct AccelCPUState {
     int cpufd;
     MshvHvCallArgs hvcall_args;
+    /*
+     * MP state, as carried by HV_REGISTER_INTERNAL_ACTIVITY_STATE. Sampled
+     * from the hypervisor by load_mp_state(), migrated by vmstate_mshv_mp_state
+     * and written back by store_mp_state(). The restore is gated on
+     * mp_state_restore_pending so that a cold boot never applies a zeroed
+     * value, which would clear StartupSuspend and start every AP early.
+     */
+    uint64_t mp_state_activity;
+    bool mp_state_restore_pending;
+    bool arm_timer_restore_pending;
+    /*
+     * Guest virtual counter (CNTVCT_EL0), captured on the source by
+     * mshv_arm_timer_pre_save() and migrated by vmstate_mshv_arm_counter.
+     *
+     * CNTV_CVAL_EL0 is an *absolute* deadline expressed in the source
+     * partition's counter timebase, so it is only meaningful alongside the
+     * counter it was measured against. Each partition's virtual counter starts
+     * near zero at creation, so without this the destination counter jumps
+     * backwards to its own (much smaller) uptime: the migrated deadline then
+     * sits far in the future and the guest's virtual timer stalls for exactly
+     * as long as the source VM had been running.
+     *
+     * arm_timer_cntvct_valid says the value was actually read on the source and
+     * travels with it in the migration stream; _restore_pending says a
+     * migration delivered a valid one and it has not been applied yet. Both are
+     * required so that a cold boot never writes a zeroed counter, and so a
+     * source that could not sample the counter leaves the destination's own
+     * counter alone instead of resetting it to 0.
+     */
+    uint64_t arm_timer_cntvct;
+    bool arm_timer_cntvct_valid;
+    bool arm_timer_cntvct_restore_pending;
+    /*
+     * Post-dispatch timer probe. Every readback so far happened before the VP
+     * was ever dispatched, which cannot tell "the SET was lost on the first
+     * context load" apart from "the SET stuck but PPI 27 is never asserted".
+     * Sample the same registers again after MSHV_RUN_VP has returned at least
+     * once and compare. Diagnostic only.
+     */
+    unsigned arm_timer_probe_runs;
+    bool arm_timer_probe_armed;
+    /* Destination-only dispatch accounting, armed at migration restore. */
+    bool dst_trace;
+    unsigned dst_run_ok;
+    unsigned dst_run_eintr;
+    unsigned dst_mmio;
+    uint64_t arm_timer_probe_ctl;
+    uint64_t arm_timer_probe_cval;
 };
 
 typedef struct MshvMemoryListener {
@@ -104,6 +152,8 @@ int mshv_set_vp_state(const CPUState *cpu, uint8_t type, const void *buf,
                       size_t buf_sz);
 void mshv_arch_init_vcpu(CPUState *cpu);
 void mshv_arch_destroy_vcpu(CPUState *cpu);
+int mshv_gic_rearm_timer_ppi(const CPUState *cpu);
+void mshv_gic_dump_timer_ppi(const CPUState *cpu, const char *side);
 void mshv_arch_amend_proc_features(
     union hv_partition_synthetic_processor_features *features);
 void mshv_arch_disable_partition_proc_features(

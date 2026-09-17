@@ -15,6 +15,7 @@
 #include "qemu/error-report.h"
 #include "qemu/memalign.h"
 #include "hw/arm/virt.h"
+#include "migration/vmstate.h"
 
 #include "system/cpus.h"
 #include "target/arm/cpu.h"
@@ -96,9 +97,14 @@ static const MshvRegMatch mshv_reg_match[] = {
  * AFSR0_EL1, AFSR1_EL1 and AMAIR_EL1 are intentionally omitted: QEMU models
  * them as RAZ/WI and keeps no backing state for them.
  *
- * CNTVOFF_EL2 is intentionally omitted: it is a hypervisor-owned EL2 register
- * that MSHV manages internally and rejects on HVCALL_SET_VP_REGISTERS (EINVAL).
- * KVM likewise does not sync it as a per-vCPU register.
+ * CNTVOFF_EL2 is intentionally omitted: MSHV does not implement it as a VP
+ * register at all. Both the read and the write paths fall through to
+ * "unhandled timer register" and return HV_STATUS_MSR_ACCESS_FAILED, so it can
+ * be neither sampled nor restored. The guest virtual counter is instead carried
+ * across migration by writing CNTVCT_EL0, which MSHV maps onto the VP's
+ * internal TSC and explicitly allows the parent of an exo partition to restore;
+ * see store_timer_regs(). KVM likewise does not sync CNTVOFF_EL2 as a per-vCPU
+ * register, and uses the equivalent KVM_REG_ARM_TIMER_CNT.
  */
 static const MshvRegMatch mshv_sysreg_match[] = {
     { HV_ARM64_REGISTER_SCTLR_EL1,      offsetof(CPUARMState, cp15.sctlr_el[1]) },
@@ -431,41 +437,123 @@ static int load_sys_regs(CPUState *cpu)
 }
 
 /*
- * MSHV has no explicit power-state register. Hyper-V models the PSCI power
- * state of a VP by holding it in "explicit suspend": a powered-off VP (PSCI
- * CPU_OFF, or a secondary core prior to CPU_ON) has EXPLICIT_SUSPEND.suspended
- * set, while a running VP has it cleared. This mirrors KVM's mp_state
- * (KVM_MP_STATE_STOPPED vs KVM_MP_STATE_RUNNABLE) sync.
+ * Decode HV_REGISTER_INTERNAL_ACTIVITY_STATE for logging. Takes the raw value
+ * rather than re-reading it, because every GET has to suspend the VP.
+ */
+static void mshv_log_internal_activity(const CPUState *cpu, const char *side,
+                                       uint64_t raw)
+{
+    struct hv_register_assoc activity = {
+        .name = HV_REGISTER_INTERNAL_ACTIVITY_STATE,
+    };
+
+    activity.value.internal_activity.as_uint64 = raw;
+
+    info_report("MSHV activity %s vCPU %d: startup_suspend=%d halt_suspend=%d "
+                "idle_suspend=%d raw=0x%" PRIx64,
+                side, cpu->cpu_index,
+                (int)activity.value.internal_activity.startup_suspend,
+                (int)activity.value.internal_activity.halt_suspend,
+                (int)activity.value.internal_activity.idle_suspend, raw);
+}
+
+/*
+ * MSHV has no PSCI power-state register, and HV_REGISTER_EXPLICIT_SUSPEND is
+ * not a usable substitute for one. It belongs to the root-scheduler dispatch
+ * protocol: the mshv driver clears it immediately before every MSHV_RUN_VP
+ * dispatch and sets it again once the VP stops being dispatched (see
+ * mshv_vp_{set,clear}_explicit_suspend() in drivers/hv/mshv_root_main.c). A
+ * perfectly healthy vCPU therefore reads back as "suspended" whenever it is not
+ * currently executing - which is precisely when QEMU is able to look at it.
+ * Sampling it into ARMCPU::power_state used to make every such VP appear
+ * powered off; because power_state is migrated as part of vmstate_arm_cpu, that
+ * bogus value travelled in the migration stream and the destination re-suspended
+ * every vCPU, so the guest never resumed.
+ *
+ * PSCI itself is handled inside the hypervisor for MSHV (see the comment on
+ * mshv_vcpu_thread_is_idle() in accel/mshv/mshv-all.c), so QEMU never has to
+ * drive the guest's power transitions by hand. Clearing the bit here does not
+ * by itself start the guest either: a VP only executes when a thread issues
+ * MSHV_RUN_VP, and QEMU gates that in user space via cpu_can_run(), so a
+ * paused vCPU stays paused regardless.
+ *
+ * What does have to be migrated is HV_REGISTER_INTERNAL_ACTIVITY_STATE, which
+ * is the MSHV equivalent of KVM's MP state and the only VP runnability state
+ * the hypervisor expects the VMM to carry across a migration. For exo
+ * partitions the hypervisor deliberately does not restore it itself - that is
+ * what HvRestorePartitionState does for Hyper-V-native save/restore - so this
+ * register is the exo escape hatch, and a VP is forbidden from writing its own
+ * copy. Of its three bits only StartupSuspend is migrated:
+ *
+ *   StartupSuspend  A VP the hypervisor has never started. Destination
+ *                   secondaries come up with this set, and a StartupSuspended
+ *                   VP is never dispatched, so leaving it set strands every AP
+ *                   for the lifetime of the guest. Nothing the guest does can
+ *                   clear it, so it has to travel.
+ *   IdleSuspend     The ARM64 analogue of x64 HaltSuspend. Deliberately not
+ *                   migrated: the hypervisor sets it itself whenever the VP
+ *                   executes WFI, and QEMU dispatches every vCPU, so it is
+ *                   derived state that re-establishes itself. Restoring APs
+ *                   with StartupSuspend cleared and IdleSuspend left at 0 was
+ *                   measured to work. It is also the one bit we cannot sample
+ *                   honestly, because the GET has to suspend the VP.
+ *   HaltSuspend     Rejected outright by the hypervisor on ARM64.
+ *
+ * StartupSuspend and IdleSuspend are mutually exclusive. Writing the register
+ * also re-evaluates the VP's timers, so store_regs() applies it after the
+ * timer deadline has been restored.
  */
 static int store_mp_state(const CPUState *cpu)
 {
-    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUState *cs = (CPUState *)cpu;
+    ARMCPU *arm_cpu = ARM_CPU(cs);
+    AccelCPUState *state = cpu->accel;
     int ret;
 
-    if (arm_cpu->power_state == PSCI_OFF) {
-        struct hv_register_assoc assoc = {
-            .name = HV_REGISTER_EXPLICIT_SUSPEND,
-        };
-        assoc.value.explicit_suspend.suspended = 1;
+    /*
+     * Resume the VP. The intercept suspend must be cleared before the
+     * explicit suspend, otherwise the VP would remain suspended.
+     */
+    struct hv_register_assoc assocs[2] = {};
+    assocs[0].name = HV_REGISTER_INTERCEPT_SUSPEND;
+    assocs[0].value.intercept_suspend.suspended = 0;
+    assocs[1].name = HV_REGISTER_EXPLICIT_SUSPEND;
+    assocs[1].value.explicit_suspend.suspended = 0;
 
-        ret = mshv_set_generic_regs(cpu, &assoc, 1);
-    } else {
-        /*
-         * Resume the VP. The intercept suspend must be cleared before the
-         * explicit suspend, otherwise the VP would remain suspended.
-         */
-        struct hv_register_assoc assocs[2] = {};
-        assocs[0].name = HV_REGISTER_INTERCEPT_SUSPEND;
-        assocs[0].value.intercept_suspend.suspended = 0;
-        assocs[1].name = HV_REGISTER_EXPLICIT_SUSPEND;
-        assocs[1].value.explicit_suspend.suspended = 0;
-
-        ret = mshv_set_generic_regs(cpu, assocs, 2);
-    }
-
+    ret = mshv_set_generic_regs(cpu, assocs, 2);
     if (ret < 0) {
         error_report("failed to set mp state");
         return -1;
+    }
+
+    info_report("MSHV mp_state vCPU %d: power_state=%d halted=%u",
+                cs->cpu_index, arm_cpu->power_state, cs->halted);
+
+    if (state->mp_state_restore_pending) {
+        struct hv_register_assoc activity = {
+            .name = HV_REGISTER_INTERNAL_ACTIVITY_STATE,
+        };
+
+        activity.value.internal_activity.as_uint64 = state->mp_state_activity;
+        /*
+         * Carry StartupSuspend only. HaltSuspend is rejected on ARM64, and
+         * IdleSuspend is derived state the hypervisor re-establishes on the
+         * next WFI (see the header comment).
+         */
+        activity.value.internal_activity.halt_suspend = 0;
+        activity.value.internal_activity.idle_suspend = 0;
+
+        ret = mshv_set_generic_regs(cpu, &activity, 1);
+        if (ret < 0) {
+            error_report("MSHV activity vCPU %d: SET failed ret=%d raw=0x%"
+                         PRIx64, cs->cpu_index, ret,
+                         activity.value.internal_activity.as_uint64);
+            return -1;
+        }
+
+        mshv_log_internal_activity(cpu, "restored",
+                                   activity.value.internal_activity.as_uint64);
+        state->mp_state_restore_pending = false;
     }
 
     return 0;
@@ -473,20 +561,38 @@ static int store_mp_state(const CPUState *cpu)
 
 static int load_mp_state(CPUState *cpu)
 {
-    ARMCPU *arm_cpu = ARM_CPU(cpu);
-    struct hv_register_assoc assoc = {
-        .name = HV_REGISTER_EXPLICIT_SUSPEND,
+    struct hv_register_assoc activity = {
+        .name = HV_REGISTER_INTERNAL_ACTIVITY_STATE,
     };
     int ret;
 
-    ret = mshv_get_generic_regs(cpu, &assoc, 1);
-    if (ret < 0) {
-        error_report("failed to get mp state");
-        return -1;
+    /*
+     * Never clobber a value that arrived in the migration stream but has not
+     * been applied yet; the destination's own reading is stale by definition.
+     */
+    if (cpu->accel->mp_state_restore_pending) {
+        return 0;
     }
 
-    arm_set_cpu_power_state(arm_cpu,
-        assoc.value.explicit_suspend.suspended ? PSCI_OFF : PSCI_ON);
+    /*
+     * HV_REGISTER_EXPLICIT_SUSPEND cannot be sampled to recover the guest's
+     * power state: it belongs to the dispatch protocol and always reads back
+     * set here, so it would misreport a perfectly healthy vCPU as powered off
+     * (see the comment on store_mp_state()).
+     *
+     * HV_REGISTER_INTERNAL_ACTIVITY_STATE is the register that actually
+     * carries VP runnability. Unlike its setter, which is restricted to exo
+     * partitions, the getter is permissive, so this is safe everywhere.
+     */
+    ret = mshv_get_generic_regs(cpu, &activity, 1);
+    if (ret < 0) {
+        warn_report("MSHV activity vCPU %d: GET failed ret=%d, MP state will "
+                    "not be migrated", cpu->cpu_index, ret);
+        return 0;
+    }
+
+    cpu->accel->mp_state_activity = activity.value.internal_activity.as_uint64;
+    mshv_log_internal_activity(cpu, "sampled", cpu->accel->mp_state_activity);
 
     return 0;
 }
@@ -528,6 +634,472 @@ static int load_regs(CPUState *cpu)
     return 0;
 }
 
+/*
+ * Source-side capture of the virtual timer registers. These are not part of the
+ * normal register set, so we need to explicitly save them here.
+ */
+static int mshv_arm_timer_pre_save(void *opaque)
+{
+    ARMCPU *arm_cpu = opaque;
+    CPUState *cpu = CPU(arm_cpu);
+    CPUARMState *env = &arm_cpu->env;
+    struct hv_register_assoc counter = {
+        .name = HV_ARM64_REGISTER_CNTVCT_EL0,
+    };
+    int ret;
+
+    struct hv_register_assoc assocs[] = {
+        {
+            .name = HV_ARM64_REGISTER_CNTV_CTL_EL0,
+        },
+        {
+            .name = HV_ARM64_REGISTER_CNTV_CVAL_EL0,
+        },
+    };
+
+    ret = mshv_get_generic_regs(cpu, assocs, ARRAY_SIZE(assocs));
+    if (ret < 0) {
+        error_report("MSHV ARM timer source vCPU %d: GET failed ret=%d",
+                     cpu->cpu_index, ret);
+        return -1;
+    }
+
+    env->cp15.c14_timer[GTIMER_VIRT].ctl = assocs[0].value.reg64;
+    env->cp15.c14_timer[GTIMER_VIRT].cval = assocs[1].value.reg64;
+    info_report("MSHV ARM timer source vCPU %d: GET ret=%d "
+                "CNTV_CTL=0x%" PRIx64 " CNTV_CVAL=0x%" PRIx64,
+                cpu->cpu_index, ret, assocs[0].value.reg64,
+                assocs[1].value.reg64);
+
+    ret = mshv_get_generic_regs(cpu, &counter, 1);
+    if (ret < 0) {
+        error_report("MSHV ARM timer source vCPU %d: CNTVCT GET failed "
+                     "ret=%d", cpu->cpu_index, ret);
+        cpu->accel->arm_timer_cntvct_valid = false;
+    } else {
+        cpu->accel->arm_timer_cntvct = counter.value.reg64;
+        cpu->accel->arm_timer_cntvct_valid = true;
+        info_report("MSHV ARM timer source vCPU %d: CNTVCT GET ret=%d "
+                    "CNTVCT=0x%" PRIx64,
+                    cpu->cpu_index, ret, counter.value.reg64);
+    }
+
+    return 0;
+}
+
+/*
+ * The destination callback does not touch Hyper-V because other migration
+ * sections, including the GIC, may still be loading.
+ */
+static int mshv_arm_timer_post_load(void *opaque, int version_id)
+{
+    ARMCPU *arm_cpu = opaque;
+    CPUState *cpu = CPU(arm_cpu);
+
+    cpu->accel->arm_timer_restore_pending = true;
+    return 0;
+}
+
+/* CNTV_CTL_EL0 bits. */
+#define CNTV_CTL_ENABLE  (1U << 0)
+#define CNTV_CTL_IMASK   (1U << 1)
+
+static int store_timer_regs(const CPUState *cpu)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    AccelCPUState *state = cpu->accel;
+    struct hv_register_assoc assocs[2] = {};
+    struct hv_register_assoc before[2] = {
+        {
+            .name = HV_ARM64_REGISTER_CNTV_CTL_EL0,
+        },
+        {
+            .name = HV_ARM64_REGISTER_CNTV_CVAL_EL0,
+        },
+    };
+    struct hv_register_assoc counter = {
+        .name = HV_ARM64_REGISTER_CNTVCT_EL0,
+    };
+    struct hv_register_assoc readback[2] = {
+        {
+            .name = HV_ARM64_REGISTER_CNTV_CTL_EL0,
+        },
+        {
+            .name = HV_ARM64_REGISTER_CNTV_CVAL_EL0,
+        },
+    };
+    int ret;
+
+    if (!state->arm_timer_restore_pending) {
+        return 0;
+    }
+
+    info_report("MSHV ARM timer destination vCPU %d: restore pending "
+                "CNTV_CTL=0x%" PRIx64 " CNTV_CVAL=0x%" PRIx64,
+                cpu->cpu_index,
+                env->cp15.c14_timer[GTIMER_VIRT].ctl,
+                env->cp15.c14_timer[GTIMER_VIRT].cval);
+
+    ret = mshv_get_generic_regs((CPUState *)cpu, before,
+                                ARRAY_SIZE(before));
+    if (ret < 0) {
+        error_report("MSHV ARM timer destination vCPU %d: pre-SET GET "
+                     "failed ret=%d", cpu->cpu_index, ret);
+    } else {
+        info_report("MSHV ARM timer destination vCPU %d: pre-SET GET ret=%d "
+                    "CNTV_CTL=0x%" PRIx64 " CNTV_CVAL=0x%" PRIx64,
+                    cpu->cpu_index, ret, before[0].value.reg64,
+                    before[1].value.reg64);
+    }
+
+    ret = mshv_get_generic_regs((CPUState *)cpu, &counter, 1);
+    if (ret < 0) {
+        error_report("MSHV ARM timer destination vCPU %d: pre-SET CNTVCT "
+                     "GET failed ret=%d", cpu->cpu_index, ret);
+    } else {
+        info_report("MSHV ARM timer destination vCPU %d: pre-SET CNTVCT "
+                    "GET ret=%d CNTVCT=0x%" PRIx64,
+                    cpu->cpu_index, ret, counter.value.reg64);
+    }
+
+    /*
+     * Restore the guest virtual counter before the deadline.
+     *
+     * CNTV_CVAL_EL0 is an absolute deadline in the source partition's counter
+     * timebase, so it only means anything once the counter it was measured
+     * against is back in place. Writing it while the destination counter still
+     * reads its own (much lower) uptime leaves the deadline far in the future:
+     * the timer then stalls for as long as the source VM had been running, and
+     * the guest's first counter read after resuming goes backwards, which Linux
+     * turns into a large forward jump in its timebase.
+     *
+     * CNTVOFF_EL2 is not usable here even though it is the architectural home
+     * of this offset: MSHV rejects both reads and writes of it. CNTVCT_EL0 is
+     * the supported route -- the hypervisor maps it onto the VP's internal TSC
+     * and explicitly permits the parent of an exo partition to restore it. It
+     * is the MSHV analogue of KVM_REG_ARM_TIMER_CNT.
+     *
+     * Caveat: the hypervisor keeps the reference TSC page valid across this
+     * write only while partition time is frozen, and deactivates it otherwise.
+     * A Linux guest reading CNTVCT_EL0 directly (clocksource arch_sys_counter)
+     * is unaffected, but a guest relying on that enlightenment would fall back
+     * to the register.
+     */
+    if (state->arm_timer_cntvct_restore_pending) {
+        struct hv_register_assoc restore_counter = {
+            .name = HV_ARM64_REGISTER_CNTVCT_EL0,
+            .value.reg64 = state->arm_timer_cntvct,
+        };
+
+        ret = mshv_set_generic_regs(cpu, &restore_counter, 1);
+        if (ret < 0) {
+            /*
+             * Non-fatal: leaving the counter alone reproduces the pre-fix
+             * behaviour (a stalled timer) rather than failing the migration.
+             */
+            error_report("MSHV ARM timer destination vCPU %d: CNTVCT SET "
+                         "failed ret=%d CNTVCT=0x%" PRIx64,
+                         cpu->cpu_index, ret, restore_counter.value.reg64);
+        } else {
+            info_report("MSHV ARM timer destination vCPU %d: CNTVCT SET ret=%d "
+                        "CNTVCT=0x%" PRIx64,
+                        cpu->cpu_index, ret, restore_counter.value.reg64);
+        }
+
+        state->arm_timer_cntvct_restore_pending = false;
+    }
+
+    /*
+     * Install the deadline before restoring ENABLE/IMASK. Hyper-V can then
+     * schedule the deadline or immediately assert PPI 27 if it has expired.
+     */
+    assocs[0].name = HV_ARM64_REGISTER_CNTV_CVAL_EL0;
+    assocs[0].value.reg64 = env->cp15.c14_timer[GTIMER_VIRT].cval;
+
+    assocs[1].name = HV_ARM64_REGISTER_CNTV_CTL_EL0;
+    assocs[1].value.reg64 = env->cp15.c14_timer[GTIMER_VIRT].ctl;
+
+    ret = mshv_set_generic_regs(cpu, assocs, ARRAY_SIZE(assocs));
+    if (ret < 0) {
+        error_report("MSHV ARM timer destination vCPU %d: SET failed ret=%d "
+                     "CNTV_CVAL=0x%" PRIx64 " CNTV_CTL=0x%" PRIx64,
+                     cpu->cpu_index, ret, assocs[0].value.reg64,
+                     assocs[1].value.reg64);
+        return -1;
+    }
+
+    info_report("MSHV ARM timer destination vCPU %d: SET ret=%d "
+                "CNTV_CVAL=0x%" PRIx64 " CNTV_CTL=0x%" PRIx64,
+                cpu->cpu_index, ret, assocs[0].value.reg64,
+                assocs[1].value.reg64);
+
+    ret = mshv_get_generic_regs((CPUState *)cpu, readback,
+                                ARRAY_SIZE(readback));
+    if (ret < 0) {
+        error_report("MSHV ARM timer destination vCPU %d: post-SET GET "
+                     "failed ret=%d", cpu->cpu_index, ret);
+    } else {
+        info_report("MSHV ARM timer destination vCPU %d: post-SET GET ret=%d "
+                    "CNTV_CTL=0x%" PRIx64 " CNTV_CVAL=0x%" PRIx64,
+                    cpu->cpu_index, ret, readback[0].value.reg64,
+                    readback[1].value.reg64);
+    }
+
+    counter.value.reg64 = 0;
+    ret = mshv_get_generic_regs((CPUState *)cpu, &counter, 1);
+    if (ret < 0) {
+        error_report("MSHV ARM timer destination vCPU %d: post-SET CNTVCT "
+                     "GET failed ret=%d", cpu->cpu_index, ret);
+    } else {
+        info_report("MSHV ARM timer destination vCPU %d: post-SET CNTVCT "
+                    "GET ret=%d CNTVCT=0x%" PRIx64,
+                    cpu->cpu_index, ret, counter.value.reg64);
+    }
+
+    /*
+     * Sample PPI 27 for every vCPU, not only the ones that dispatch. The
+     * secondaries never take an intercept, so they never reach the
+     * post-dispatch probe; this is the only place their GIC state is visible.
+     */
+    mshv_gic_dump_timer_ppi(cpu, "post-restore");
+
+    /*
+     * Arm the post-dispatch probe with what the hypervisor reports right now,
+     * before the VP has ever been run. mshv_run_vcpu() re-reads these after
+     * MSHV_RUN_VP returns; a divergence proves the values were clobbered by
+     * the context load rather than simply never delivered.
+     */
+    state->arm_timer_probe_ctl = readback[0].value.reg64;
+    state->arm_timer_probe_cval = readback[1].value.reg64;
+    state->arm_timer_probe_runs = 0;
+    state->arm_timer_probe_armed = true;
+    state->dst_trace = true;
+
+    state->arm_timer_restore_pending = false;
+
+    /*
+     * Hyper-V accepted the writes above but will discard them when the VP
+     * leaves precise work, so the restored deadline never re-asserts PPI 27.
+     * Deliver one timer interrupt through the GIC state path instead, which is
+     * not affected by that defect, and let the guest reprogram the timer for
+     * itself.
+     */
+    if ((env->cp15.c14_timer[GTIMER_VIRT].ctl & CNTV_CTL_ENABLE) &&
+        !(env->cp15.c14_timer[GTIMER_VIRT].ctl & CNTV_CTL_IMASK)) {
+        mshv_gic_rearm_timer_ppi(cpu);
+    }
+
+    return 0;
+}
+
+/*
+ * Diagnostic probe. Every timer readback prior to this one was taken before the
+ * destination VP had ever been dispatched, which cannot distinguish:
+ *
+ *   (a) the SET persisted and PPI 27 is simply never asserted, from
+ *   (b) the first context load overwrote EL02 from a stale inactive store.
+ *
+ * Re-read the same registers after MSHV_RUN_VP has returned and compare against
+ * the pre-dispatch sample stashed by store_timer_regs(). Limited to the first
+ * few dispatches because each GET suspends the VP.
+ */
+#define MSHV_TIMER_PROBE_DISPATCHES 8
+
+/* ISR_EL1 / DAIF interrupt bits. */
+#define ARM_IRQ_BIT_I (1ULL << 7)
+#define ARM_IRQ_BIT_F (1ULL << 6)
+
+static void mshv_arm_timer_probe_post_dispatch(CPUState *cpu)
+{
+    AccelCPUState *state = cpu->accel;
+    struct hv_register_assoc probe[2] = {
+        {
+            .name = HV_ARM64_REGISTER_CNTV_CTL_EL0,
+        },
+        {
+            .name = HV_ARM64_REGISTER_CNTV_CVAL_EL0,
+        },
+    };
+    struct hv_register_assoc counter = {
+        .name = HV_ARM64_REGISTER_CNTVCT_EL0,
+    };
+    struct hv_register_assoc core[4] = {
+        {
+            .name = HV_ARM64_REGISTER_PC,
+        },
+        {
+            .name = HV_ARM64_REGISTER_PSTATE,
+        },
+        {
+            .name = HV_ARM64_REGISTER_DAIF,
+        },
+        {
+            .name = HV_ARM64_REGISTER_ISR_EL1,
+        },
+    };
+    bool persisted;
+    int core_ret[4];
+    unsigned i;
+    int ret;
+
+    if (!state->arm_timer_probe_armed) {
+        return;
+    }
+
+    state->arm_timer_probe_runs++;
+
+    ret = mshv_get_generic_regs(cpu, probe, ARRAY_SIZE(probe));
+    if (ret < 0) {
+        error_report("MSHV ARM timer probe vCPU %d: post-dispatch GET failed "
+                     "ret=%d", cpu->cpu_index, ret);
+        state->arm_timer_probe_armed = false;
+        return;
+    }
+
+    if (mshv_get_generic_regs(cpu, &counter, 1) < 0) {
+        counter.value.reg64 = 0;
+    }
+
+    /*
+     * Read these one at a time: a single unsupported register name fails the
+     * whole batch, and a silently zeroed batch is indistinguishable from a
+     * guest genuinely reading zero.
+     */
+    for (i = 0; i < ARRAY_SIZE(core); i++) {
+        core_ret[i] = mshv_get_generic_regs(cpu, &core[i], 1);
+        if (core_ret[i] < 0) {
+            core[i].value.reg64 = 0;
+        }
+    }
+
+    persisted = (probe[0].value.reg64 == state->arm_timer_probe_ctl) &&
+                (probe[1].value.reg64 == state->arm_timer_probe_cval);
+
+    info_report("MSHV ARM timer probe vCPU %d: after dispatch #%u "
+                "CNTV_CTL=0x%" PRIx64 " CNTV_CVAL=0x%" PRIx64
+                " CNTVCT=0x%" PRIx64 " (pre-dispatch CNTV_CTL=0x%" PRIx64
+                " CNTV_CVAL=0x%" PRIx64 ") %s",
+                cpu->cpu_index, state->arm_timer_probe_runs,
+                probe[0].value.reg64, probe[1].value.reg64,
+                counter.value.reg64, state->arm_timer_probe_ctl,
+                state->arm_timer_probe_cval,
+                persisted ? "TIMER-REGS-SAME" : "TIMER-REGS-CHANGED");
+
+    /*
+     * ISR_EL1.I reports whether an IRQ is currently being presented to the
+     * core by the CPU interface, and DAIF.I whether the guest has IRQs masked.
+     * Together they separate "the interrupt never arrives" from "it arrives
+     * but the guest cannot take it".
+     */
+    info_report("MSHV ARM core probe vCPU %d: after dispatch #%u "
+                "PC=0x%" PRIx64 "(r%d) PSTATE=0x%" PRIx64 "(r%d) "
+                "DAIF=0x%" PRIx64 "(r%d) ISR_EL1=0x%" PRIx64 "(r%d) "
+                "ISR.I=%d ISR.F=%d DAIF.I=%d -> %s",
+                cpu->cpu_index, state->arm_timer_probe_runs,
+                core[0].value.reg64, core_ret[0],
+                core[1].value.reg64, core_ret[1],
+                core[2].value.reg64, core_ret[2],
+                core[3].value.reg64, core_ret[3],
+                !!(core[3].value.reg64 & ARM_IRQ_BIT_I),
+                !!(core[3].value.reg64 & ARM_IRQ_BIT_F),
+                !!(core[2].value.reg64 & ARM_IRQ_BIT_I),
+                core_ret[3] < 0 ? "ISR-UNREADABLE"
+                : (core[3].value.reg64 & ARM_IRQ_BIT_I)
+                    ? ((core[2].value.reg64 & ARM_IRQ_BIT_I)
+                           ? "IRQ-PENDING-BUT-MASKED"
+                           : "IRQ-PENDING-UNMASKED")
+                    : "NO-IRQ-AT-CORE");
+
+    /*
+     * Sample PPI 27 in the same window as CNTV_CTL above. If CNTV_CTL reads
+     * 0x5 (expired) while PPI 27 reads asserted=0, the hypervisor never
+     * asserted it and the fault is upstream, in the assertion path. If it
+     * reads asserted=1, assertion works and the fault is in delivery.
+     */
+    mshv_gic_dump_timer_ppi(cpu, "post-dispatch");
+
+    if (state->arm_timer_probe_runs >= MSHV_TIMER_PROBE_DISPATCHES) {
+        state->arm_timer_probe_armed = false;
+    }
+}
+
+static const VMStateDescription vmstate_mshv_arm_timer = {
+    .name = "cpu/mshv-arm-timer",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = mshv_arm_timer_pre_save,
+    .post_load = mshv_arm_timer_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(env.cp15.c14_timer[GTIMER_VIRT].ctl, ARMCPU),
+        VMSTATE_UINT64(env.cp15.c14_timer[GTIMER_VIRT].cval, ARMCPU),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+/*
+ * The guest virtual counter travels in its own section, with the same
+ * deferred-apply discipline as MP state: post_load only records that a value
+ * arrived, and store_timer_regs() writes it once the rest of the VM is loaded.
+ *
+ * Validity travels as data rather than through a .needed predicate. .needed is
+ * evaluated before any pre_save runs, so it cannot observe a value sampled
+ * during save; carrying the flag in the stream instead makes the restore
+ * fail-safe -- if the source could not read the counter, the destination is
+ * told so explicitly and simply keeps its own.
+ *
+ * The counter is sampled in mshv_arm_timer_pre_save() rather than here, so that
+ * it is read in the same window as CNTV_CVAL_EL0: the deadline is only
+ * meaningful relative to the counter it was measured against, and the virtual
+ * counter keeps advancing while the VM is stopped. That makes this section's
+ * contents depend on the timer section having been saved first, which holds
+ * because mshv_arch_init_vcpu() registers them in that order.
+ */
+static int mshv_arm_counter_post_load(void *opaque, int version_id)
+{
+    AccelCPUState *state = opaque;
+
+    state->arm_timer_cntvct_restore_pending = state->arm_timer_cntvct_valid;
+    return 0;
+}
+
+static const VMStateDescription vmstate_mshv_arm_counter = {
+    .name = "cpu/mshv-arm-counter",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = mshv_arm_counter_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(arm_timer_cntvct_valid, AccelCPUState),
+        VMSTATE_UINT64(arm_timer_cntvct, AccelCPUState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+/*
+ * MP state travels as its own subsection rather than through ARMCPU, because it
+ * is sampled straight out of the hypervisor by load_mp_state() and has no
+ * QEMU-side representation. The destination must not apply it from post_load:
+ * other migration sections, including the GIC, may still be loading, so just
+ * record that a restore is due and let store_mp_state() perform it.
+ */static int mshv_mp_state_post_load(void *opaque, int version_id)
+{
+    AccelCPUState *state = opaque;
+
+    state->mp_state_restore_pending = true;
+    return 0;
+}
+
+static const VMStateDescription vmstate_mshv_mp_state = {
+    .name = "cpu/mshv-mp-state",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = mshv_mp_state_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(mp_state_activity, AccelCPUState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static int store_regs(const CPUState *cpu)
 {
     int ret;
@@ -556,6 +1128,17 @@ static int store_regs(const CPUState *cpu)
         return -1;
     }
 
+    ret = store_timer_regs(cpu);
+    if (ret < 0) {
+        error_report("Failed to store virtual timer state");
+        return -1;
+    }
+
+    /*
+     * Last: writing the activity register re-evaluates the VP's timers, so the
+     * restored deadline has to be in place first, and a VP should only be made
+     * runnable once the rest of its state has landed.
+     */
     ret = store_mp_state(cpu);
     if (ret < 0) {
         error_report("Failed to store mp state");
@@ -622,6 +1205,19 @@ static int handle_unmapped_mem(int vm_fd, CPUState *cpu,
     }
 
     syndrome.raw = info.syndrome;
+
+    if (cpu->accel->dst_trace) {
+        AccelCPUState *st = cpu->accel;
+        st->dst_mmio++;
+        if (st->dst_mmio <= 40 || (st->dst_mmio % 2000) == 0) {
+            info_report("MSHV MMIO dst vCPU %d: #%u gpa=0x%" PRIx64
+                        " gva=0x%" PRIx64 " write=%d pc=0x%" PRIx64,
+                        cpu->cpu_index, st->dst_mmio,
+                        (uint64_t)info.guest_physical_address,
+                        (uint64_t)info.guest_virtual_address,
+                        syndrome.iss >> 6 & 1, (uint64_t)env->pc);
+        }
+    }
 
     /*
      * MMIO emulation must touch as little vCPU state as possible. Only the
@@ -725,12 +1321,50 @@ int mshv_run_vcpu(int vm_fd, CPUState *cpu, hv_message *msg, MshvVmExit *exit)
 {
     int ret;
     int cpu_fd = mshv_vcpufd(cpu);
+    AccelCPUState *state = cpu->accel;
+
+    if (state->arm_timer_probe_armed) {
+        info_report("MSHV VP dispatch vCPU %d: entering MSHV_RUN_VP #%u",
+                    cpu->cpu_index, state->arm_timer_probe_runs + 1);
+    }
 
     ret = ioctl(cpu_fd, MSHV_RUN_VP, msg);
-    if (ret < 0) {
+    if (ret < 0) {        if (state->dst_trace) {
+            state->dst_run_eintr++;
+            if (state->dst_run_eintr <= 20 ||
+                (state->dst_run_eintr % 500) == 0) {
+                error_report("MSHV VP dst vCPU %d: RUN_VP errno=%d (%s) "
+                             "[cumulative ok=%u eintr=%u]", cpu->cpu_index,
+                             errno, strerror(errno), state->dst_run_ok,
+                             state->dst_run_eintr);
+            }
+        }
+        if (state->arm_timer_probe_armed) {
+            error_report("MSHV VP dispatch vCPU %d: MSHV_RUN_VP FAILED "
+                         "ret=%d errno=%d (%s)", cpu->cpu_index, ret,
+                         errno, strerror(errno));
+        }
         *exit = MshvVmExitShutdown;
         return -errno;
     }
+
+    if (state->dst_trace) {
+        state->dst_run_ok++;
+        if (state->dst_run_ok <= 5 || (state->dst_run_ok % 2000) == 0) {
+            info_report("MSHV VP dst vCPU %d: RUN_VP ok msg=0x%x "
+                        "[cumulative ok=%u eintr=%u]", cpu->cpu_index,
+                        msg->header.message_type, state->dst_run_ok,
+                        state->dst_run_eintr);
+        }
+    }
+
+    if (state->arm_timer_probe_armed) {
+        info_report("MSHV VP dispatch vCPU %d: returned from MSHV_RUN_VP #%u "
+                    "message_type=0x%x", cpu->cpu_index,
+                    state->arm_timer_probe_runs + 1, msg->header.message_type);
+    }
+
+    mshv_arm_timer_probe_post_dispatch(cpu);
 
     switch (msg->header.message_type) {
     case HVMSG_NONE:
@@ -764,11 +1398,19 @@ void mshv_arch_init_vcpu(CPUState *cpu)
     AccelCPUState *state = cpu->accel;
 
     mshv_setup_hvcall_args(state);
+    vmstate_register(NULL, cpu->cpu_index,
+                     &vmstate_mshv_arm_timer, ARM_CPU(cpu));
+    vmstate_register(NULL, cpu->cpu_index, &vmstate_mshv_arm_counter, state);
+    vmstate_register(NULL, cpu->cpu_index, &vmstate_mshv_mp_state, state);
 }
 
 void mshv_arch_destroy_vcpu(CPUState *cpu)
 {
     AccelCPUState *state = cpu->accel;
+
+    vmstate_unregister(NULL, &vmstate_mshv_mp_state, state);
+    vmstate_unregister(NULL, &vmstate_mshv_arm_counter, state);
+    vmstate_unregister(NULL, &vmstate_mshv_arm_timer, ARM_CPU(cpu));
 
     if (state->hvcall_args.base) {
         qemu_vfree(state->hvcall_args.base);
